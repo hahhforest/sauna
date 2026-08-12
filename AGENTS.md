@@ -1,6 +1,9 @@
 # AGENTS.md — Reasoning Recovery 研究项目
 
-本仓库**唯一**项目文档。研究目标：恢复模型 hidden reasoning，完整落盘，供语言学、心理学、社会学分析思考模式。
+研究目标：恢复模型 hidden reasoning，完整落盘，供语言学、心理学、社会学分析思考模式。
+
+对外入口（GitHub 首页预览）：[README.md](./README.md)（中文）· [README_EN.md](./README_EN.md)（English）。  
+**本文件**是协作者 / Agent 的操作手册：方法原理、完整实验表、硬约定。README 保持轻量，细节以本文件为准。
 
 ```text
 Source 模型 → reasoning envelope → Decoder replay → 完整恢复正文 + 四维证据
@@ -15,7 +18,7 @@ Source 模型 → reasoning envelope → Decoder replay → 完整恢复正文 +
 3. **凭证只放项目 `config.yaml` 或环境变量**，不写进仓库；不读取 `~/.minimax` 等全局 agent 配置。
 4. 文档与注释默认**中文**；与上游 API 交互的 prompt 字符串可保持英文（协议兼容）。
 5. 每个脚本有模块 docstring；函数有简洁中文注释。
-6. **只维护本文件**，不另写 README；用法、原理、结果表都放这里。
+6. **文档分工**：`README.md` / `README_EN.md` = 对外落地页（互指）；`AGENTS.md` = 方法原理 + 实验状态 + agent 约定。改对外介绍时同步中英文 README；改实验表/方法时改本文件。
 
 ## 目录与架构
 
@@ -241,4 +244,4 @@ python3 -m unittest test_recovery_harness.py -v
 2. 重跑矩阵用 `scripts/run_provider_matrix.py`；确认 JSON 里有 `text` / `candidate_texts`。
 3. 更新**本文件**结果表：以最新 `runs/provider_matrix_combined.json` 为准。
 4. 不要重新引入“只存 text_length、不存 text”的脱敏逻辑。
-5. 不要新建 README；新增方法时：`methods/` 实现 + `method_registry()` 注册 + 本文件补原理行与矩阵结果行。
+5. 新增方法：`methods/` 实现 + `method_registry()` 注册 + 本文件补原理行与矩阵结果行；若对外特性列表变化，同步 `README.md` / `README_EN.md` 的简短 bullet。
