@@ -91,15 +91,31 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def load_local_key() -> tuple[str | None, str | None]:
-    """环境变量缺失时，从本机 MiniMax config 读取 mafia provider 凭证。"""
-    config_path = Path("/Users/minimax/.minimax/config.yaml")
+    """环境变量缺失时，尝试从本机用户目录下的 MiniMax config 读取凭证。
+
+    仅运行时读取本地文件，绝不把 key 写入仓库或结果 JSON。
+    路径用 Path.home()，避免把具体用户名硬编码进公开代码。
+    """
+    config_path = Path.home() / ".minimax" / "config.yaml"
     if not config_path.exists():
         return None, None
     try:
         config = yaml.safe_load(config_path.read_text())
-        provider = config["custom_provider"]["mafia"]
-        options = provider["options"]
-        return options.get("baseURL"), options.get("apiKey")
+        # 兼容常见自定义 provider 结构；任一字段缺失则返回空
+        custom = config.get("custom_provider") or {}
+        if not isinstance(custom, dict):
+            return None, None
+        for provider in custom.values():
+            if not isinstance(provider, dict):
+                continue
+            options = provider.get("options") or {}
+            if not isinstance(options, dict):
+                continue
+            base = options.get("baseURL") or options.get("base_url")
+            key = options.get("apiKey") or options.get("api_key")
+            if base and key:
+                return base, key
+        return None, None
     except (OSError, KeyError, TypeError, yaml.YAMLError):
         return None, None
 
