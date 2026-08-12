@@ -4,8 +4,7 @@
 
 ### Reasoning Recovery Research Harness
 
-**把模型的 hidden reasoning 恢复成可读正文**  
-面向语言学 · 心理学 · 社会学的思考模式研究
+**把模型的 hidden reasoning 恢复成可读正文**
 
 [English](./README_EN.md) · [内部文档 AGENTS.md](./AGENTS.md) · [配置模板](./config.example.yaml)
 

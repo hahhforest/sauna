@@ -4,8 +4,7 @@
 
 ### Reasoning Recovery Research Harness
 
-**Recover hidden model reasoning into readable text**  
-For linguistic, psychological, and sociological analysis of thinking patterns
+**Recover hidden model reasoning into readable text**
 
 [中文](./README.md) · [Internal docs: AGENTS.md](./AGENTS.md) · [Config template](./config.example.yaml)
 
