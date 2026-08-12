@@ -106,12 +106,18 @@ class ProviderSingleReplayMethod:
 
 
 class ClaudeReconciliationMethod(ReconciliationMethod):
-    """Claude 多候选 + Opus 级 reconciler 合并。"""
+    """Claude 多候选 + reconciler 合并；reconciler 模型 id 由配置解析注入。"""
 
-    def __init__(self, candidate_pool: int = 3, selection_count: int = 3) -> None:
+    def __init__(
+        self,
+        candidate_pool: int = 3,
+        selection_count: int = 3,
+        *,
+        reconciler_model: str = "claude-opus-4-8",
+    ) -> None:
         super().__init__(
             ClaudeFuzzyExtractionMethod(),
-            "claude-opus-4-8",
+            reconciler_model,
             candidate_count=selection_count,
             candidate_pool=candidate_pool,
             name="claude.reconciliation",
@@ -119,12 +125,18 @@ class ClaudeReconciliationMethod(ReconciliationMethod):
 
 
 class GeminiReconciliationMethod(ReconciliationMethod):
-    """Gemini 多候选 + flash reconciler 合并。"""
+    """Gemini 多候选 + reconciler 合并；reconciler 模型 id 由配置解析注入。"""
 
-    def __init__(self, candidate_pool: int = 20, selection_count: int = 3) -> None:
+    def __init__(
+        self,
+        candidate_pool: int = 20,
+        selection_count: int = 3,
+        *,
+        reconciler_model: str = "gemini-3.5-flash",
+    ) -> None:
         super().__init__(
             GeminiFuzzyExtractionMethod(),
-            "gemini-3.5-flash",
+            reconciler_model,
             candidate_count=selection_count,
             candidate_pool=candidate_pool,
             name="gemini.reconciliation",

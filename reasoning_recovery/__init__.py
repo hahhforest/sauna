@@ -5,7 +5,15 @@
 不启动 Web 服务，不持久化凭证。
 """
 
-from .config import AppConfig, UpstreamConfig, build_settings, load_app_config
+from .config import (
+    AppConfig,
+    ModelEntry,
+    ResolvedMethodRun,
+    UpstreamConfig,
+    list_runnable_methods,
+    load_app_config,
+    resolve_method_run,
+)
 from .engine import RecoveryEngine
 from .errors import ProbeError
 from .models import (
@@ -27,11 +35,14 @@ __all__ = [
     "HarvestRecord",
     "MethodContext",
     "MethodResult",
+    "ModelEntry",
     "ProbeError",
     "RecoveryEngine",
     "RecoveryResult",
+    "ResolvedMethodRun",
     "Settings",
     "UpstreamConfig",
-    "build_settings",
+    "list_runnable_methods",
     "load_app_config",
+    "resolve_method_run",
 ]

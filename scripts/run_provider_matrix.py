@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """跨 provider 的 reasoning 恢复实验矩阵。
 
-研究用途：完整落盘恢复正文、候选文本、source 元数据与错误详情，
-供后续语言学 / 心理学 / 社会学分析。不脱敏、不截断恢复文本。
+按 config 中的模型骨架展开：只跑「能完整解析角色依赖」的方法。
+完整落盘恢复正文。
 """
 
 from __future__ import annotations
@@ -18,51 +18,19 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from reasoning_probe import method_registry
-from reasoning_recovery.config import build_settings, client_from_settings, load_app_config
+from reasoning_recovery.catalog import FAMILY_DEFAULT_METHODS, default_catalog
+from reasoning_recovery.config import (
+    client_from_settings,
+    list_runnable_methods,
+    load_app_config,
+    resolve_method_run,
+)
 from reasoning_recovery.engine import RecoveryEngine
 from reasoning_recovery.errors import ProbeError
-from reasoning_recovery.methods import (
-    ClaudeFuzzyExtractionMethod,
-    ClaudeReconciliationMethod,
-    GeminiFuzzyExtractionMethod,
-    GeminiReconciliationMethod,
-)
 from reasoning_recovery.protocol import adapter_for
 
 
-# 默认实验 prompt：简单算术，便于对照恢复内容是否忠于 hidden reasoning。
 PROMPT = "Answer in one sentence: what is 17 * 19? Do the arithmetic carefully."
-
-# 默认方法 × 模型矩阵。可用 CLI 过滤子集。
-MATRIX = {
-    "gpt": {
-        "protocol": "responses",
-        "sources": ("gpt-5.6-sol",),
-        "decoders": ("gpt-5.6-luna", "gpt-5.6-terra"),
-        "methods": (
-            "gpt.single_replay",
-            "gpt.repeated_injection",
-            "gpt.chunk_continuation",
-            "gpt.single_best_of_3",
-            "gpt.repeated_best_of_3",
-            "gpt.luna_then_terra",
-            "gpt.reconcile_with_terra",
-        ),
-    },
-    "claude": {
-        "protocol": "anthropic_messages",
-        "sources": ("claude-fable-5", "claude-opus-4-8", "claude-sonnet-5"),
-        "decoders": ("claude-haiku-4-5",),
-        "methods": ("claude.fuzzy_prefill", "claude.reconciliation"),
-    },
-    "gemini": {
-        "protocol": "gemini",
-        "sources": ("gemini-3.1-pro-preview", "gemini-3.6-flash"),
-        "decoders": ("gemini-3.1-flash-lite", "gemini-3.5-flash"),
-        "methods": ("gemini.fuzzy_prefill", "gemini.reconciliation"),
-    },
-}
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -72,10 +40,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--base-url", default="", help="覆盖 upstream.base_url")
     parser.add_argument("--api-key", default="", help="覆盖 upstream.api_key")
     parser.add_argument("--prompt", default=PROMPT)
-    parser.add_argument("--providers", default="gpt,claude,gemini")
-    parser.add_argument("--sources", default="", help="逗号分隔的 source 模型过滤")
-    parser.add_argument("--decoders", default="", help="逗号分隔的 decoder 模型过滤")
-    parser.add_argument("--methods", default="", help="逗号分隔的方法过滤")
+    parser.add_argument("--families", default="", help="逗号分隔家族过滤：gpt,claude,gemini；空=全部已配置")
+    parser.add_argument("--methods", default="", help="逗号分隔方法过滤；空=该家族默认可跑方法")
     parser.add_argument("--efforts", default="high")
     parser.add_argument("--candidate-pool", type=int, default=3)
     parser.add_argument("--selection-count", type=int, default=3)
@@ -88,14 +54,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def list_model_ids(client: Any, timeout: float) -> tuple[set[str] | None, str | None]:
-    """拉取上游 /models，返回可用模型 id 集合（复用客户端 header/鉴权）。"""
+    """拉取上游 /models。"""
     try:
         if hasattr(client, "get"):
             payload = client.get("models", timeout)
         else:
             return None, "MODELS_DISCOVERY_UNSUPPORTED"
-    except ProbeError:
-        return None, "MODELS_DISCOVERY_FAILED"
     except Exception:
         return None, "MODELS_DISCOVERY_FAILED"
     data = payload.get("data") if isinstance(payload, dict) else None
@@ -105,57 +69,36 @@ def list_model_ids(client: Any, timeout: float) -> tuple[set[str] | None, str | 
     return ids, None
 
 
-def build_methods(provider: str, pool: int, selection_count: int) -> dict[str, object]:
-    """按 provider 组装方法注册表。"""
-    if provider == "gpt":
-        return method_registry()
-    if provider == "claude":
-        return {
-            "claude.fuzzy_prefill": ClaudeFuzzyExtractionMethod(),
-            "claude.reconciliation": ClaudeReconciliationMethod(
-                candidate_pool=pool, selection_count=min(selection_count, pool)
-            ),
-        }
-    if provider == "gemini":
-        return {
-            "gemini.fuzzy_prefill": GeminiFuzzyExtractionMethod(),
-            "gemini.reconciliation": GeminiReconciliationMethod(
-                candidate_pool=pool, selection_count=min(selection_count, pool)
-            ),
-        }
-    raise ValueError(f"unknown provider: {provider}")
-
-
 def research_result(
     *,
-    provider: str,
-    source_model: str,
-    decoder_model: str,
-    protocol: str,
-    effort: str,
+    family: str,
     method: str,
+    resolved: Any,
     result: Any,
     elapsed_s: float,
     source_retry: int,
     prompt: str,
+    effort: str,
 ) -> dict[str, Any]:
-    """把一次成功/半成功的 engine 结果转成完整研究记录（含恢复正文）。"""
+    """完整研究记录。"""
     source = result.metadata.get("source", {})
     method_metadata = result.metadata.get("method_metadata", {})
     if not isinstance(method_metadata, dict):
         method_metadata = {}
     return {
-        "provider": provider,
-        "protocol": protocol,
-        "source_model": source_model,
-        "decoder_model": decoder_model,
+        "family": family,
+        "provider": family,
+        "protocol": resolved.settings.protocol,
+        "source_model": resolved.role_ids.get("source"),
+        "decoder_model": resolved.role_ids.get("decoder"),
+        "role_names": resolved.role_names,
+        "role_ids": resolved.role_ids,
         "effort": effort,
         "method": method,
         "status": "ok" if result.text else "method_empty",
         "elapsed_s": round(elapsed_s, 2),
         "source_retry": source_retry,
         "prompt": prompt,
-        # 研究核心：完整恢复正文与候选
         "text": result.text,
         "text_length": len(result.text),
         "source": source,
@@ -176,43 +119,28 @@ def research_result(
             for attempt in result.attempts
         ],
         "method_metadata": method_metadata,
+        "resolution_log": list(resolved.resolution_log),
         "terminal_error": result.metadata.get("terminal_error"),
     }
 
 
-def error_record(
-    *,
-    provider: str,
-    source_model: str,
-    decoder_model: str,
-    protocol: str,
-    effort: str,
-    method: str,
-    status: str,
-    code: str,
-    details: dict[str, Any] | None = None,
-    elapsed_s: float = 0.0,
-    source_retry: int | None = None,
-    prompt: str | None = None,
-) -> dict[str, Any]:
-    """构造错误记录；保留完整 details 便于排障与分析。"""
+def error_record(**kwargs: Any) -> dict[str, Any]:
+    """错误记录。"""
     return {
-        "provider": provider,
-        "protocol": protocol,
-        "source_model": source_model,
-        "decoder_model": decoder_model,
-        "effort": effort,
-        "method": method,
-        "status": status,
-        "elapsed_s": round(elapsed_s, 2),
-        "source_retry": source_retry,
-        "prompt": prompt,
-        "error": {"code": code, "details": details or {}},
+        "family": kwargs.get("family", ""),
+        "provider": kwargs.get("family", ""),
+        "method": kwargs.get("method", ""),
+        "effort": kwargs.get("effort", ""),
+        "status": kwargs.get("status", "error"),
+        "elapsed_s": round(kwargs.get("elapsed_s", 0.0), 2),
+        "source_retry": kwargs.get("source_retry"),
+        "prompt": kwargs.get("prompt"),
+        "error": {"code": kwargs.get("code", "ERROR"), "details": kwargs.get("details") or {}},
     }
 
 
 def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
-    """执行矩阵：遍历 provider × source × decoder × effort × method。"""
+    """执行矩阵：已配置家族 × 可解析方法 × effort。"""
     try:
         app = load_app_config(args.config or None, require=True)
     except ProbeError as exc:
@@ -222,138 +150,205 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     if args.api_key:
         app = replace(app, upstream=replace(app.upstream, api_key=args.api_key))
 
-    # 用 defaults 协议建一个客户端做 /models 发现
-    probe_settings = build_settings(app, max_output_tokens=args.max_output_tokens, timeout=args.timeout)
-    shared_client = client_from_settings(probe_settings)
-    model_ids, discovery_error = list_model_ids(shared_client, args.timeout)
+    # 探测客户端：用任意可解析方法的 settings，否则仅 upstream
+    probe_client = None
+    try:
+        sample = resolve_method_run(app, max_output_tokens=16, timeout=args.timeout)
+        probe_client = client_from_settings(sample.settings)
+    except ProbeError:
+        from reasoning_recovery.models import Settings
+        from reasoning_recovery.protocol import UrllibJsonClient
+
+        probe_client = UrllibJsonClient(
+            app.upstream.base_url,
+            app.upstream.api_key,
+            headers=app.upstream.headers,
+            auth=app.upstream.auth,
+            auth_header=app.upstream.auth_header,
+            auth_prefix=app.upstream.auth_prefix,
+        )
+
+    model_ids, discovery_error = list_model_ids(probe_client, args.timeout)
     records: list[dict[str, Any]] = []
     efforts = tuple(item.strip() for item in args.efforts.split(",") if item.strip())
-    source_filter = {item.strip() for item in args.sources.split(",") if item.strip()}
-    decoder_filter = {item.strip() for item in args.decoders.split(",") if item.strip()}
+    family_filter = {item.strip() for item in args.families.split(",") if item.strip()}
     method_filter = {item.strip() for item in args.methods.split(",") if item.strip()}
+    catalog = default_catalog()
+    runnable = set(list_runnable_methods(app, catalog))
 
-    for provider in (item.strip() for item in args.providers.split(",")):
-        if not provider:
+    families = sorted(app.families())
+    if family_filter:
+        families = [f for f in families if f in family_filter]
+
+    if not families:
+        raise SystemExit("没有可跑的家族：请在 config.yaml models 中配置模型")
+
+    for family in families:
+        default_methods = FAMILY_DEFAULT_METHODS.get(family, ())
+        methods = [
+            m
+            for m in default_methods
+            if (not method_filter or m in method_filter) and m in runnable
+        ]
+        # 也允许 CLI 指定默认可跑之外的方法
+        if method_filter:
+            for m in method_filter:
+                if m in runnable and m not in methods and catalog.get(m) and catalog[m].family == family:
+                    methods.append(m)
+
+        if not methods:
+            records.append(
+                error_record(
+                    family=family,
+                    method="*",
+                    status="skipped",
+                    code="NO_RUNNABLE_METHODS",
+                    details={
+                        "hint": f"family={family} 已配置模型，但没有方法能解析全部角色",
+                        "configured": {
+                            n: {"id": e.model_id, "roles": sorted(e.roles)}
+                            for n, e in app.models.items()
+                            if e.family == family
+                        },
+                    },
+                    prompt=args.prompt,
+                )
+            )
             continue
-        config = MATRIX[provider]
-        methods = build_methods(provider, args.candidate_pool, args.selection_count)
-        sources = tuple(model for model in config["sources"] if not source_filter or model in source_filter)
-        decoders = tuple(model for model in config["decoders"] if not decoder_filter or model in decoder_filter)
-        selected_methods = tuple(
-            method for method in config["methods"] if not method_filter or method in method_filter
-        )
-        for source_model in sources:
-            for decoder_model in decoders:
-                for effort in efforts:
-                    for method in selected_methods:
-                        common = {
-                            "provider": provider,
-                            "source_model": source_model,
-                            "decoder_model": decoder_model,
-                            "protocol": config["protocol"],
-                            "effort": effort,
-                            "method": method,
-                            "prompt": args.prompt,
-                        }
-                        if model_ids is not None and (
-                            source_model not in model_ids or decoder_model not in model_ids
-                        ):
-                            records.append(
-                                error_record(
-                                    **common,
-                                    status="not_available",
-                                    code="MODEL_NOT_LISTED",
-                                    details={
-                                        "source_listed": source_model in model_ids,
-                                        "decoder_listed": decoder_model in model_ids,
-                                    },
-                                )
-                            )
-                            continue
 
-                        settings = build_settings(
-                            app,
-                            source_model=source_model,
-                            decoder_model=decoder_model,
-                            protocol=config["protocol"],
-                            effort=effort,
-                            max_output_tokens=args.max_output_tokens,
-                            timeout=args.timeout,
+        for effort in efforts:
+            for method in methods:
+                common = {
+                    "family": family,
+                    "method": method,
+                    "effort": effort,
+                    "prompt": args.prompt,
+                }
+                try:
+                    resolved = resolve_method_run(
+                        app,
+                        method=method,
+                        effort=effort,
+                        max_output_tokens=args.max_output_tokens,
+                        timeout=args.timeout,
+                        candidate_pool=args.candidate_pool,
+                        selection_count=args.selection_count,
+                        catalog=catalog,
+                    )
+                except ProbeError as exc:
+                    records.append(
+                        error_record(
+                            **common,
+                            status="unresolved",
+                            code=exc.code,
+                            details=exc.details if isinstance(exc.details, dict) else {"raw": exc.details},
                         )
-                        # 每个协议可能有不同 headers；按 settings 重建客户端
-                        client = client_from_settings(settings)
-                        adapter = adapter_for(settings, client)
-                        engine = RecoveryEngine(adapter, methods)
+                    )
+                    print(json.dumps({"method": method, "status": "unresolved", "code": exc.code}, ensure_ascii=False), flush=True)
+                    continue
 
-                        finished = False
-                        for source_retry in range(1, max(args.source_retries, 1) + 1):
-                            started = time.monotonic()
-                            try:
-                                result = engine.recover(settings, args.prompt, method=method)
-                            except ProbeError as exc:
-                                elapsed = time.monotonic() - started
-                                if exc.code == "SOURCE_NO_REASONING_ENVELOPE" and source_retry < args.source_retries:
-                                    continue
-                                records.append(
-                                    error_record(
-                                        **common,
-                                        status="error",
-                                        code=exc.code,
-                                        details=exc.details if isinstance(exc.details, dict) else {"raw": exc.details},
-                                        elapsed_s=elapsed,
-                                        source_retry=source_retry,
-                                    )
-                                )
-                                finished = True
-                                break
-                            except Exception as exc:  # pragma: no cover - 实网边界保护
-                                records.append(
-                                    error_record(
-                                        **common,
-                                        status="error",
-                                        code="MATRIX_INTERNAL_ERROR",
-                                        details={"type": type(exc).__name__, "message": str(exc)},
-                                        elapsed_s=time.monotonic() - started,
-                                        source_retry=source_retry,
-                                    )
-                                )
-                                finished = True
-                                break
-                            else:
-                                records.append(
-                                    research_result(
-                                        **common,
-                                        result=result,
-                                        elapsed_s=time.monotonic() - started,
-                                        source_retry=source_retry,
-                                    )
-                                )
-                                finished = True
-                                break
-                        if not finished:
-                            records.append(error_record(**common, status="error", code="MATRIX_NO_RESULT"))
-                        # 流式打印摘要，正文完整写在最终 JSON
-                        summary = {
-                            "method": records[-1].get("method"),
-                            "status": records[-1].get("status"),
-                            "text_length": records[-1].get("text_length"),
-                            "error": (records[-1].get("error") or {}).get("code"),
-                        }
-                        print(json.dumps(summary, ensure_ascii=False), flush=True)
+                # 上游模型列表校验（可选）
+                if model_ids is not None:
+                    missing = [
+                        mid
+                        for mid in resolved.role_ids.values()
+                        if mid not in model_ids
+                    ]
+                    if missing:
+                        records.append(
+                            error_record(
+                                **common,
+                                status="not_available",
+                                code="MODEL_NOT_LISTED",
+                                details={"missing_ids": missing, "roles": resolved.role_ids},
+                            )
+                        )
+                        continue
+
+                client = client_from_settings(resolved.settings)
+                adapter = adapter_for(resolved.settings, client)
+                engine = RecoveryEngine(adapter, {resolved.method: resolved.strategy})
+                finished = False
+                for source_retry in range(1, max(args.source_retries, 1) + 1):
+                    started = time.monotonic()
+                    try:
+                        result = engine.recover(
+                            resolved.settings, args.prompt, method=resolved.method
+                        )
+                    except ProbeError as exc:
+                        elapsed = time.monotonic() - started
+                        if exc.code == "SOURCE_NO_REASONING_ENVELOPE" and source_retry < args.source_retries:
+                            continue
+                        records.append(
+                            error_record(
+                                **common,
+                                status="error",
+                                code=exc.code,
+                                details=exc.details if isinstance(exc.details, dict) else {"raw": exc.details},
+                                elapsed_s=elapsed,
+                                source_retry=source_retry,
+                            )
+                        )
+                        finished = True
+                        break
+                    except Exception as exc:  # pragma: no cover
+                        records.append(
+                            error_record(
+                                **common,
+                                status="error",
+                                code="MATRIX_INTERNAL_ERROR",
+                                details={"type": type(exc).__name__, "message": str(exc)},
+                                elapsed_s=time.monotonic() - started,
+                                source_retry=source_retry,
+                            )
+                        )
+                        finished = True
+                        break
+                    else:
+                        records.append(
+                            research_result(
+                                family=family,
+                                method=method,
+                                resolved=resolved,
+                                result=result,
+                                elapsed_s=time.monotonic() - started,
+                                source_retry=source_retry,
+                                prompt=args.prompt,
+                                effort=effort,
+                            )
+                        )
+                        finished = True
+                        break
+                if not finished:
+                    records.append(error_record(**common, status="error", code="MATRIX_NO_RESULT"))
+                last = records[-1]
+                print(
+                    json.dumps(
+                        {
+                            "method": last.get("method"),
+                            "status": last.get("status"),
+                            "roles": last.get("role_names"),
+                            "text_length": last.get("text_length"),
+                            "error": (last.get("error") or {}).get("code"),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
 
     return {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "prompt": args.prompt,
         "prompt_sha256": hashlib.sha256(args.prompt.encode()).hexdigest(),
+        "configured_models": {
+            name: {"id": m.model_id, "family": m.family, "roles": sorted(m.roles)}
+            for name, m in app.models.items()
+        },
+        "runnable_methods": sorted(runnable),
         "models_discovery": {
             "status": "ok" if model_ids is not None else "error",
             "count": len(model_ids) if model_ids is not None else None,
             "error": discovery_error,
-            "relevant_ids": sorted(
-                model_id
-                for model_id in (model_ids or set())
-                if model_id.startswith(("gpt-5.6", "claude-", "gemini-3."))
-            ),
         },
         "parameters": {
             "efforts": efforts,
@@ -367,50 +362,45 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def markdown_report(payload: dict[str, Any]) -> str:
-    """生成含恢复正文预览的 Markdown 报告。"""
+    """Markdown 摘要 + 全文。"""
     lines = [
-        "# 跨 Provider Reasoning 恢复矩阵",
+        "# Reasoning 恢复矩阵",
         "",
-        "研究完整记录。JSON 含全文；下表摘要 + 恢复正文预览（前 200 字）。",
+        "按模型骨架展开；仅跑可解析方法。",
         "",
         f"prompt: `{payload.get('prompt', '')}`",
         "",
-        "| provider | source | decoder | method | status | replay | provenance | coverage | fidelity | tokens(src→rec) | ratio | elapsed | text preview |",
-        "|---|---|---|---|---|---|---|---|---|---|---:|---:|---|",
+        "configured models: "
+        + ", ".join(
+            f"{k}({v['family']}:{','.join(v['roles'])})"
+            for k, v in (payload.get("configured_models") or {}).items()
+        ),
+        "",
+        "| family | method | source | decoder | status | replay | ratio | text_len | elapsed |",
+        "|---|---|---|---|---|---|---:|---:|---:|",
     ]
     for row in payload["records"]:
-        dims = row.get("dimensions", {})
-        coverage = dims.get("coverage", {})
-        text = row.get("text") or ""
-        preview = text.replace("|", "\\|").replace("\n", " ")[:200]
-        src_tok = coverage.get("source_tokens", "-")
-        rec_tok = coverage.get("recovered_tokens", "-")
+        dims = row.get("dimensions") or {}
+        cov = dims.get("coverage") or {}
         lines.append(
-            "| {provider} | {source_model} | {decoder_model} | {method} | {status} | {replay} | {provenance} | {coverage} | {fidelity} | {tokens} | {ratio} | {elapsed} | {preview} |".format(
-                provider=row.get("provider", ""),
-                source_model=row.get("source_model", ""),
-                decoder_model=row.get("decoder_model", ""),
+            "| {family} | {method} | {source} | {decoder} | {status} | {replay} | {ratio} | {tlen} | {elapsed} |".format(
+                family=row.get("family", ""),
                 method=row.get("method", ""),
+                source=row.get("source_model", "-"),
+                decoder=row.get("decoder_model", "-"),
                 status=row.get("status", ""),
-                replay=dims.get("replay", {}).get("status", "-"),
-                provenance=dims.get("provenance", {}).get("status", "-"),
-                coverage=coverage.get("status", "-"),
-                fidelity=dims.get("fidelity", {}).get("status", "-"),
-                tokens=f"{src_tok}→{rec_tok}",
-                ratio=coverage.get("ratio", "-"),
+                replay=(dims.get("replay") or {}).get("status", "-"),
+                ratio=cov.get("ratio", "-"),
+                tlen=row.get("text_length", "-"),
                 elapsed=row.get("elapsed_s", "-"),
-                preview=preview or (row.get("error") or {}).get("code", ""),
             )
         )
-    # 附完整恢复正文，便于人工阅读
     lines.extend(["", "## 完整恢复正文", ""])
     for index, row in enumerate(payload["records"], 1):
         text = row.get("text")
         if not text:
             continue
-        lines.append(
-            f"### {index}. {row.get('provider')} | {row.get('source_model')} → {row.get('decoder_model')} | {row.get('method')}"
-        )
+        lines.append(f"### {index}. {row.get('method')} · {row.get('source_model')} → {row.get('decoder_model')}")
         lines.append("")
         lines.append("```")
         lines.append(text)
@@ -420,7 +410,6 @@ def markdown_report(payload: dict[str, Any]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """入口：跑矩阵并写出 JSON + Markdown。"""
     args = parse_args(argv or sys.argv[1:])
     payload = run_matrix(args)
     output = Path(args.output)
@@ -435,6 +424,7 @@ def main(argv: list[str] | None = None) -> int:
                 "output": str(output),
                 "markdown_output": str(markdown),
                 "record_count": len(payload["records"]),
+                "runnable_methods": payload.get("runnable_methods"),
             },
             ensure_ascii=False,
         )

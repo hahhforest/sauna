@@ -73,37 +73,45 @@ cd sauna
 pip install pyyaml   # 读 YAML 配置需要
 ```
 
-### 2. 配置上游
+### 2. 配置上游 + 模型骨架
 
 ```bash
 cp config.example.yaml config.yaml
 ```
 
-编辑 `config.yaml`（**不会提交到 Git**）：
+编辑 `config.yaml`（**不会提交到 Git**）。核心不是写死 source/decoder 配对，而是声明**你有哪些模型**：
 
 ```yaml
 upstream:
   base_url: "https://your-upstream.example/v1"
   api_key: "sk-..."
-  auth: bearer          # bearer | x-api-key | header | none
-  headers:              # 可选，按网关要求添加
-    HTTP-Referer: "https://github.com/hahhforest/sauna"
+  headers:
     X-Title: "sauna-reasoning-recovery"
 
-defaults:
-  source_model: "gpt-5.6-sol"
-  decoder_model: "gpt-5.6-luna"
-  protocol: "responses"
+models:
+  sol:
+    family: gpt
+    id: gpt-5.6-sol
+    roles: [source]
+  luna:
+    family: gpt
+    id: gpt-5.6-luna
+    roles: [decoder]
+  terra:
+    family: gpt
+    id: gpt-5.6-terra
+    roles: [decoder, reconciler]
 ```
 
-> 也可用环境变量覆盖：`UPSTREAM_BASE_URL` / `UPSTREAM_API_KEY`  
-> **不读取** `~/.minimax` 等全局 agent 配置。
+> 方法自己声明依赖（如 `gpt.luna_then_terra` 需要 luna）。缺模型会报错并走 fallback。  
+> `python3 reasoning_probe.py --list-methods` 可查看当前能跑什么。  
+> **不读取** `~/.minimax`。
 
 ### 3. 跑一次恢复
 
 ```bash
 python3 reasoning_probe.py '请计算 17 * 23，并给出最终结果。'
-# 完整 JSON 打印；可加 --output runs/one.json
+python3 reasoning_probe.py --method gpt.single_replay --output runs/one.json '...'
 ```
 
 ### 4. 跑跨 provider 矩阵（可选）

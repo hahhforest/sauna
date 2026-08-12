@@ -505,52 +505,76 @@ class HarnessTests(unittest.TestCase):
         )
         self.assertEqual(custom._build_headers()["X-Api-Key"], "secret")
 
-    def test_project_config_yaml_builds_settings_with_headers(self) -> None:
+    def test_model_skeleton_resolves_methods_and_fallbacks(self) -> None:
         import tempfile
         from pathlib import Path
 
-        from reasoning_recovery.config import build_settings, load_app_config
+        from reasoning_recovery.config import list_runnable_methods, load_app_config, resolve_method_run
+        from reasoning_recovery.errors import ProbeError
 
+        # 只配 sol + terra：无 luna → luna_then_terra 应 unresolved 并 fallback 到 single_replay
         text = """
 upstream:
   base_url: https://gateway.example/v1
   api_key: cfg-key
-  auth: bearer
   headers:
-    X-Title: from-upstream
-protocols:
-  anthropic_messages:
-    auth: x-api-key
-    headers:
-      anthropic-version: "2023-06-01"
-defaults:
-  source_model: gpt-src
-  decoder_model: gpt-dec
-  protocol: responses
+    X-Title: sauna
+runtime:
+  effort: high
 models:
-  opus:
-    id: claude-opus-x
-    protocol: anthropic_messages
-    model_config:
-      prefill_tag: "<thinking-copy>"
+  sol:
+    family: gpt
+    id: gpt-5.6-sol
+    protocol: responses
+    roles: [source]
+  terra:
+    family: gpt
+    id: gpt-5.6-terra
+    protocol: responses
+    roles: [decoder, reconciler]
 """
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.yaml"
             path.write_text(text, encoding="utf-8")
-            app = load_app_config(path)
-            gpt = build_settings(app)
-            self.assertEqual(gpt.base_url, "https://gateway.example/v1")
-            self.assertEqual(gpt.api_key, "cfg-key")
-            self.assertEqual(gpt.extra_headers["X-Title"], "from-upstream")
-            self.assertEqual(gpt.auth, "bearer")
+            app = load_app_config(path, require=True)
+            self.assertEqual(app.families(), {"gpt"})
 
-            claude = build_settings(app, source_profile="opus", decoder_model="claude-dec")
-            self.assertEqual(claude.protocol, "anthropic_messages")
-            self.assertEqual(claude.source_model, "claude-opus-x")
-            self.assertEqual(claude.auth, "x-api-key")
-            self.assertEqual(claude.extra_headers["anthropic-version"], "2023-06-01")
-            self.assertEqual(claude.extra_headers["X-Title"], "from-upstream")
-            self.assertEqual(claude.model_config["prefill_tag"], "<thinking-copy>")
+            with self.assertRaises(ProbeError) as raised:
+                resolve_method_run(app, method="claude.fuzzy_prefill")
+            self.assertIn(raised.exception.code, {"FAMILY_NOT_CONFIGURED", "METHOD_UNRESOLVED"})
+
+            run = resolve_method_run(app, method="gpt.single_replay")
+            self.assertEqual(run.role_names["source"], "sol")
+            self.assertEqual(run.role_names["decoder"], "terra")
+            self.assertEqual(run.settings.source_model, "gpt-5.6-sol")
+            self.assertEqual(run.settings.decoder_model, "gpt-5.6-terra")
+            self.assertEqual(run.settings.extra_headers["X-Title"], "sauna")
+
+            run2 = resolve_method_run(app, method="gpt.luna_then_terra")
+            self.assertEqual(run2.method, "gpt.single_replay")
+            self.assertTrue(any("unresolved" in line for line in run2.resolution_log))
+
+            runnable = list_runnable_methods(app)
+            self.assertIn("gpt.single_replay", runnable)
+            self.assertNotIn("gpt.luna_then_terra", runnable)
+            self.assertNotIn("claude.fuzzy_prefill", runnable)
+
+        text2 = text + """
+  luna:
+    family: gpt
+    id: gpt-5.6-luna
+    protocol: responses
+    roles: [decoder]
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.yaml"
+            path.write_text(text2, encoding="utf-8")
+            app = load_app_config(path, require=True)
+            run = resolve_method_run(app, method="gpt.luna_then_terra")
+            self.assertEqual(run.method, "gpt.luna_then_terra")
+            self.assertEqual(run.role_names["decoder"], "luna")
+            self.assertEqual(run.role_names["fallback_decoder"], "terra")
+            self.assertEqual(run.role_ids["fallback_decoder"], "gpt-5.6-terra")
 
 
 if __name__ == "__main__":

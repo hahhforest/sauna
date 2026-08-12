@@ -16,9 +16,10 @@ Source 模型 → reasoning envelope → Decoder replay → 完整恢复正文 +
 1. **目的是恢复 reasoning**，不是做安全产品演示。
 2. **结果完整落盘**：恢复正文、候选文本、envelope 元数据、错误 details 全部写入 `runs/`；不做脱敏截断。
 3. **凭证只放项目 `config.yaml` 或环境变量**，不写进仓库；不读取 `~/.minimax` 等全局 agent 配置。
-4. 文档与注释默认**中文**；与上游 API 交互的 prompt 字符串可保持英文（协议兼容）。
-5. 每个脚本有模块 docstring；函数有简洁中文注释。
-6. **文档分工**：`README.md` / `README_EN.md` = 对外落地页（互指）；`AGENTS.md` = 方法原理 + 实验状态 + agent 约定。改对外介绍时同步中英文 README；改实验表/方法时改本文件。
+4. **配置 = 模型骨架，不是 source/decoder 配对**：你声明配了哪些模型（family + roles）；方法自己声明角色依赖与 prefer 链；缺模型明确报错并走方法 fallback。
+5. 文档与注释默认**中文**；与上游 API 交互的 prompt 字符串可保持英文（协议兼容）。
+6. 每个脚本有模块 docstring；函数有简洁中文注释。
+7. **文档分工**：`README.md` / `README_EN.md` = 对外落地页；`AGENTS.md` = 方法原理 + 实验状态 + agent 约定。
 
 ## 目录与架构
 
@@ -51,88 +52,56 @@ test_recovery_harness.py
 
 `Settings.model_config` 可覆盖 signature 字段、Claude thinking、Gemini thinking level、prefill 标签。协议形状变化应加 adapter，不要在方法层堆 provider 分支。
 
-## 配置
+## 配置（模型骨架）
 
 ```bash
 cp config.example.yaml config.yaml
-# 编辑 config.yaml：填 base_url、api_key、需要的 headers
+# 填 upstream + 你实际有的 models
+python3 reasoning_probe.py --list-methods   # 看当前能跑哪些方法
 ```
 
-配置优先级（后者覆盖前者）：
+### 思路
 
-1. `config.yaml`（或 `SAUNA_CONFIG` / `--config`）
-2. 环境变量 `UPSTREAM_BASE_URL` / `UPSTREAM_API_KEY`
-3. CLI 参数（`--base-url`、`--api-key`、`--header` 等）
+| 层 | 谁写 | 含义 |
+|---|---|---|
+| `models.*` | 用户 | 我有 sol / terra / haiku…（逻辑名 → 上游 id + family + roles） |
+| `catalog`（代码） | 项目 | 方法 `gpt.luna_then_terra` 需要 source=sol、decoder=luna、fallback_decoder=terra |
+| `resolve_method_run` | 运行时 | prefer 链解析；缺模型 → `ROLE_UNRESOLVED` → 试 `on_unresolved` / CLI `--fallback` |
 
-`config.yaml` 结构要点：
+例子：只配了 `sol` + `terra`（没有 `luna`）→ `gpt.single_replay` 的 decoder prefer=`[luna,terra]` 会落到 terra；`gpt.luna_then_terra` 的 decoder prefer=`[luna]` 全失败 → 报错并 fallback 到 `gpt.single_replay`。  
+没配任何 claude 模型 → `claude.*` 直接 `FAMILY_NOT_CONFIGURED`。
+
+### 结构
 
 | 段 | 作用 |
 |---|---|
-| `upstream` | `base_url`、`api_key`、`auth`（bearer / x-api-key / header / none）、`headers` |
-| `defaults` | 默认 source/decoder/protocol/effort/timeout |
-| `protocols.<name>` | 按协议附加 header / 改 auth / `model_config` |
-| `models.<profile>` | 命名模型档案：`id`、`protocol`、`headers`、`model_config` |
+| `upstream` | base_url / api_key / auth / headers |
+| `runtime` | effort / timeout / default_family（不是 source/decoder 配对） |
+| `models.<逻辑名>` | `family` + `id` + `roles` + 可选 protocol/headers/model_config |
+| `protocols.<名>` | 按协议附加 header / auth |
+| `methods.<名>.prefer` | 可选，覆盖方法默认 prefer 链 |
 
-自定义 header 示例（OpenRouter / 企业网关常见）：
-
-```yaml
-upstream:
-  base_url: "https://openrouter.ai/api/v1"
-  api_key: "sk-or-..."
-  headers:
-    HTTP-Referer: "https://github.com/hahhforest/sauna"
-    X-Title: "sauna-reasoning-recovery"
-```
-
-Anthropic 风格网关：
-
-```yaml
-upstream:
-  base_url: "https://your-gateway.example"
-  api_key: "sk-ant-..."
-  auth: x-api-key
-protocols:
-  anthropic_messages:
-    headers:
-      anthropic-version: "2023-06-01"
-```
-
-依赖：读取 YAML 需要 `PyYAML`（`pip install pyyaml`）。
+依赖：`pip install pyyaml`。
 
 ## 使用
 
 ```bash
-# 单次恢复（读 config.yaml）
+# 查看当前骨架下可跑方法
+python3 reasoning_probe.py --list-methods
+
+# 单次恢复（自动按方法依赖解析模型）
 python3 reasoning_probe.py '请计算 17 * 23，并给出最终结果。'
-python3 reasoning_probe.py \
-  --decoder-model gpt-5.6-terra \
-  --method gpt.repeated_injection \
-  --fallback gpt.single_best_of_3,gpt.chunk_continuation \
-  --header 'X-Title:sauna' \
+python3 reasoning_probe.py --method gpt.repeated_injection \
+  --fallback gpt.single_replay,gpt.chunk_continuation \
   --output runs/one.json \
   '请解决一个多步数学问题。'
 
-# 换协议 / 模型配置
-python3 reasoning_probe.py --protocol gemini \
-  --model-config '{"prefill_tag":"<thought>","thinking_level_field":"thinkingLevel"}' \
-  '请解决一个简单的代数问题。'
+# 指定家族默认方法链
+python3 reasoning_probe.py --family claude '...'
 
-# 实网检查
-python3 scripts/live_gpt_check.py \
-  --methods gpt.single_replay,gpt.repeated_injection \
-  --output runs/live_check.json \
-  '请计算 17 * 23，只返回最终结果。'
-
-# 跨 provider 矩阵（完整落盘）
-python3 scripts/run_provider_matrix.py \
-  --providers gpt,claude,gemini \
-  --candidate-pool 3 --selection-count 3 \
-  --output runs/provider_matrix.json \
-  --markdown-output runs/provider_matrix.md
-
-python3 scripts/merge_matrix_results.py runs/gpt.json runs/claude.json runs/gemini.json \
-  --output runs/provider_matrix_combined.json \
-  --markdown-output runs/provider_matrix_combined.md
+# 矩阵：只跑已配置且可解析的方法
+python3 scripts/run_provider_matrix.py --families gpt,claude \
+  --output runs/provider_matrix.json
 
 # 测试
 python3 -m unittest test_recovery_harness.py -v

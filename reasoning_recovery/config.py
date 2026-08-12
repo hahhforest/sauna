@@ -1,12 +1,13 @@
-"""项目本地配置加载。
+"""项目本地配置：模型骨架 + 方法依赖解析。
 
-优先级（后者覆盖前者）：
-1. config.example.yaml 同结构的默认空值
-2. 项目 config.yaml（或 SAUNA_CONFIG 指定路径）
-3. 环境变量 UPSTREAM_BASE_URL / UPSTREAM_API_KEY
-4. CLI 显式参数
+配置只声明「有哪些模型」；方法在 catalog 里声明角色依赖。
+解析规则：
+  - 方法需要 family 下具备某 capability 的模型
+  - prefer 链按序找已配置逻辑名；找不到则在同 family 里找任意具备该 capability 的模型
+  - 必需角色全部失败 → METHOD_UNRESOLVED，再走 on_unresolved 方法链
+  - 没配任何 gpt 模型 → 不能跑 gpt.*（FAMILY_NOT_CONFIGURED）
 
-不读取 ~/.minimax 或其他全局 agent 配置。
+不读取 ~/.minimax。
 """
 
 from __future__ import annotations
@@ -16,10 +17,15 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from .catalog import (
+    FAMILY_DEFAULT_METHODS,
+    MethodSpec,
+    RoleNeed,
+    default_catalog,
+)
 from .errors import ProbeError
 from .models import Settings
 
-# 仓库根目录（本文件在 reasoning_recovery/ 下）
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = _REPO_ROOT / "config.yaml"
 EXAMPLE_CONFIG_PATH = _REPO_ROOT / "config.example.yaml"
@@ -38,14 +44,59 @@ class UpstreamConfig:
 
 
 @dataclass(frozen=True)
+class ModelEntry:
+    """一个已配置的逻辑模型。"""
+
+    name: str
+    family: str
+    model_id: str
+    protocol: str
+    roles: frozenset[str]
+    effort: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+    model_config: dict[str, Any] = field(default_factory=dict)
+    auth: str | None = None
+    auth_header: str | None = None
+    auth_prefix: str | None = None
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """完整应用配置快照。"""
 
     upstream: UpstreamConfig
-    defaults: dict[str, Any] = field(default_factory=dict)
+    runtime: dict[str, Any] = field(default_factory=dict)
     protocols: dict[str, Any] = field(default_factory=dict)
-    models: dict[str, Any] = field(default_factory=dict)
+    models: dict[str, ModelEntry] = field(default_factory=dict)
+    method_overrides: dict[str, Any] = field(default_factory=dict)
     path: Path | None = None
+
+    def families(self) -> set[str]:
+        """已配置模型覆盖的家族集合。"""
+        return {m.family for m in self.models.values()}
+
+    def models_for(self, family: str, capability: str | None = None) -> list[ModelEntry]:
+        """列出某家族（可选某角色能力）的模型。"""
+        out = [m for m in self.models.values() if m.family == family]
+        if capability:
+            out = [m for m in out if capability in m.roles]
+        return out
+
+
+@dataclass(frozen=True)
+class ResolvedMethodRun:
+    """一次可执行的方法解析结果。"""
+
+    method: str
+    family: str
+    # 角色名 → 逻辑模型名
+    role_names: dict[str, str]
+    # 角色名 → 上游 model id
+    role_ids: dict[str, str]
+    settings: Settings
+    strategy: Any
+    # 解析轨迹（调试 / 落盘）
+    resolution_log: tuple[str, ...] = ()
 
 
 def resolve_config_path(explicit: str | Path | None = None) -> Path | None:
@@ -63,12 +114,7 @@ def resolve_config_path(explicit: str | Path | None = None) -> Path | None:
 
 
 def load_app_config(path: str | Path | None = None, *, require: bool = False) -> AppConfig:
-    """加载 YAML 配置并叠加环境变量。
-
-    Args:
-        path: 显式配置路径；默认找 config.yaml / SAUNA_CONFIG。
-        require: True 时缺少 base_url/api_key 直接报错。
-    """
+    """加载 YAML：upstream + models 骨架 + runtime。"""
     config_path = resolve_config_path(path)
     raw: dict[str, Any] = {}
     if config_path is not None:
@@ -82,21 +128,24 @@ def load_app_config(path: str | Path | None = None, *, require: bool = False) ->
     auth_prefix = upstream_raw.get("auth_prefix")
     if auth_prefix is not None and not isinstance(auth_prefix, str):
         auth_prefix = str(auth_prefix)
-    headers = _as_str_dict(upstream_raw.get("headers"))
 
-    upstream = UpstreamConfig(
-        base_url=base_url.rstrip("/"),
-        api_key=api_key,
-        auth=auth,
-        auth_header=auth_header,
-        auth_prefix=auth_prefix,
-        headers=headers,
-    )
+    # 兼容旧 defaults 段
+    runtime = dict(raw.get("runtime") or raw.get("defaults") or {})
+
+    models = _parse_models(raw.get("models") or {})
     app = AppConfig(
-        upstream=upstream,
-        defaults=dict(raw.get("defaults") or {}),
+        upstream=UpstreamConfig(
+            base_url=base_url.rstrip("/"),
+            api_key=api_key,
+            auth=auth,
+            auth_header=auth_header,
+            auth_prefix=auth_prefix,
+            headers=_as_str_dict(upstream_raw.get("headers")),
+        ),
+        runtime=runtime,
         protocols=dict(raw.get("protocols") or {}),
-        models=dict(raw.get("models") or {}),
+        models=models,
+        method_overrides=dict(raw.get("methods") or {}),
         path=config_path,
     )
     if require:
@@ -105,124 +154,126 @@ def load_app_config(path: str | Path | None = None, *, require: bool = False) ->
             missing.append("upstream.base_url / UPSTREAM_BASE_URL")
         if not app.upstream.api_key and app.upstream.auth != "none":
             missing.append("upstream.api_key / UPSTREAM_API_KEY")
+        if not app.models:
+            missing.append("models（至少一个逻辑模型）")
         if missing:
             raise ProbeError(
                 "CONFIG_MISSING",
-                "缺少上游配置：" + "、".join(missing)
-                + f"。请复制 {EXAMPLE_CONFIG_PATH.name} 为 config.yaml 并填写，"
-                "或设置环境变量。",
+                "缺少配置：" + "、".join(missing)
+                + f"。请复制 {EXAMPLE_CONFIG_PATH.name} 为 config.yaml 并填写模型骨架。",
                 details={"config_path": str(config_path) if config_path else None},
             )
     return app
 
 
-def build_settings(
+def resolve_method_run(
     app: AppConfig,
+    method: str | None = None,
     *,
-    source_model: str | None = None,
-    decoder_model: str | None = None,
-    protocol: str | None = None,
+    family: str | None = None,
+    fallback_methods: tuple[str, ...] | list[str] = (),
     effort: str | None = None,
     max_output_tokens: int | None = None,
     timeout: float | None = None,
-    model_config: dict[str, Any] | None = None,
-    source_profile: str | None = None,
-    decoder_profile: str | None = None,
     extra_headers: dict[str, str] | None = None,
-) -> Settings:
-    """从 AppConfig + CLI 覆盖构造 Settings。"""
-    defaults = app.defaults
-    source_meta = _profile(app, source_profile)
-    decoder_meta = _profile(app, decoder_profile)
+    model_config: dict[str, Any] | None = None,
+    candidate_pool: int | None = None,
+    selection_count: int | None = None,
+    catalog: dict[str, MethodSpec] | None = None,
+) -> ResolvedMethodRun:
+    """按方法依赖解析模型角色，失败则沿 fallback / on_unresolved 链继续。"""
+    cat = catalog or default_catalog()
+    log: list[str] = []
 
-    resolved_protocol = (
-        protocol
-        or _as_str(source_meta.get("protocol"))
-        or _as_str(defaults.get("protocol"))
-        or "responses"
-    )
-    protocol_block = dict(app.protocols.get(resolved_protocol) or {})
+    chain = _build_method_chain(app, method, family, fallback_methods, cat, log)
+    errors: list[dict[str, Any]] = []
 
-    # header 合并：upstream < protocol < source profile < decoder profile < CLI
-    headers: dict[str, str] = {}
-    headers.update(app.upstream.headers)
-    headers.update(_as_str_dict(protocol_block.get("headers")))
-    headers.update(_as_str_dict(source_meta.get("headers")))
-    headers.update(_as_str_dict(decoder_meta.get("headers")))
-    if extra_headers:
-        headers.update(extra_headers)
+    for name in chain:
+        spec = cat.get(name)
+        if spec is None:
+            log.append(f"{name}: unknown method")
+            errors.append({"method": name, "code": "METHOD_UNKNOWN"})
+            continue
+        if not app.models_for(spec.family):
+            log.append(f"{name}: family {spec.family} not configured")
+            errors.append(
+                {
+                    "method": name,
+                    "code": "FAMILY_NOT_CONFIGURED",
+                    "family": spec.family,
+                    "hint": f"在 config.yaml 的 models 下配置 family={spec.family} 的模型",
+                }
+            )
+            continue
 
-    # auth 可被 protocol 覆盖
-    auth = (_as_str(protocol_block.get("auth")) or app.upstream.auth or "bearer").lower()
-    auth_header = _as_str(protocol_block.get("auth_header")) or app.upstream.auth_header
-    auth_prefix = protocol_block.get("auth_prefix", app.upstream.auth_prefix)
-    if auth_prefix is not None and not isinstance(auth_prefix, str):
-        auth_prefix = str(auth_prefix)
+        try:
+            role_names, role_ids, role_entries = _resolve_roles(app, spec, log)
+        except ProbeError as exc:
+            log.append(f"{name}: unresolved — {exc.message}")
+            errors.append({"method": name, "code": exc.code, "details": exc.details})
+            # 方法自身 on_unresolved 插入后续链（去重）
+            for nxt in spec.on_unresolved:
+                if nxt not in chain:
+                    chain.append(nxt)
+            continue
 
-    merged_model_config: dict[str, Any] = {}
-    merged_model_config.update(dict(protocol_block.get("model_config") or {}))
-    merged_model_config.update(dict(source_meta.get("model_config") or {}))
-    merged_model_config.update(dict(decoder_meta.get("model_config") or {}))
-    if model_config:
-        merged_model_config.update(model_config)
-
-    source = (
-        source_model
-        or _as_str(source_meta.get("id"))
-        or _as_str(defaults.get("source_model"))
-        or "gpt-5.6-sol"
-    )
-    decoder = (
-        decoder_model
-        or _as_str(decoder_meta.get("id"))
-        or _as_str(defaults.get("decoder_model"))
-        or "gpt-5.6-luna"
-    )
-    resolved_effort = (
-        effort
-        or _as_str(source_meta.get("effort"))
-        or _as_str(defaults.get("effort"))
-        or "high"
-    )
-    resolved_max = (
-        max_output_tokens
-        if max_output_tokens is not None
-        else _as_int(defaults.get("max_output_tokens"), 4096)
-    )
-    resolved_timeout = (
-        timeout if timeout is not None else _as_float(defaults.get("timeout"), 120.0)
-    )
-
-    if not app.upstream.base_url:
-        raise ProbeError(
-            "CONFIG_MISSING_BASE_URL",
-            "缺少 base_url：请在 config.yaml 的 upstream.base_url 填写，或设 UPSTREAM_BASE_URL",
+        settings = _settings_for_roles(
+            app,
+            family=spec.family,
+            source=role_entries["source"],
+            decoder=role_entries["decoder"],
+            effort=effort,
+            max_output_tokens=max_output_tokens,
+            timeout=timeout,
+            extra_headers=extra_headers,
+            model_config=model_config,
         )
-    if not app.upstream.api_key and auth != "none":
-        raise ProbeError(
-            "CONFIG_MISSING_API_KEY",
-            "缺少 api_key：请在 config.yaml 的 upstream.api_key 填写，或设 UPSTREAM_API_KEY",
+        resolved = ResolvedMethodRun(
+            method=name,
+            family=spec.family,
+            role_names=role_names,
+            role_ids=role_ids,
+            settings=settings,
+            strategy=None,
+            resolution_log=tuple(log + [f"{name}: ok source={role_names['source']} decoder={role_names['decoder']}"]),
         )
+        options = {
+            "candidate_pool": candidate_pool if candidate_pool is not None else 3,
+            "selection_count": selection_count if selection_count is not None else 3,
+        }
+        if spec.build is None:
+            raise ProbeError("METHOD_NO_BUILDER", f"方法无 builder: {name}")
+        try:
+            strategy = spec.build(resolved=resolved, **options)
+        except TypeError:
+            strategy = spec.build(**options)
+        return replace(resolved, strategy=strategy)
 
-    return Settings(
-        base_url=app.upstream.base_url,
-        api_key=app.upstream.api_key,
-        source_model=source,
-        decoder_model=decoder,
-        protocol=resolved_protocol,
-        effort=resolved_effort,
-        max_output_tokens=resolved_max,
-        timeout=resolved_timeout,
-        model_config=merged_model_config,
-        extra_headers=headers,
-        auth=auth,
-        auth_header=auth_header,
-        auth_prefix=auth_prefix,
+    raise ProbeError(
+        "METHOD_UNRESOLVED",
+        "没有可执行的方法：所需模型未配置，或 prefer 链全部落空。"
+        "请在 config.yaml 的 models 中补齐对应 family/roles，或换方法。",
+        details={"tried": errors, "log": log, "configured_models": sorted(app.models.keys())},
     )
+
+
+def list_runnable_methods(app: AppConfig, catalog: dict[str, MethodSpec] | None = None) -> list[str]:
+    """返回当前配置下能完整解析的方法名。"""
+    cat = catalog or default_catalog()
+    runnable: list[str] = []
+    for name, spec in cat.items():
+        if not app.models_for(spec.family):
+            continue
+        try:
+            _resolve_roles(app, spec, [])
+        except ProbeError:
+            continue
+        runnable.append(name)
+    return runnable
 
 
 def client_from_settings(settings: Settings):
-    """按 Settings 构造 HTTP 客户端（延迟 import 避免环依赖）。"""
+    """按 Settings 构造 HTTP 客户端。"""
     from .protocol import UrllibJsonClient
 
     return UrllibJsonClient(
@@ -235,18 +286,276 @@ def client_from_settings(settings: Settings):
     )
 
 
-def with_decoder(settings: Settings, decoder_model: str) -> Settings:
-    """仅替换 decoder_model。"""
-    return replace(settings, decoder_model=decoder_model)
+# ---- 内部：模型骨架解析 ----
 
 
-def _profile(app: AppConfig, name: str | None) -> dict[str, Any]:
-    if not name:
-        return {}
-    block = app.models.get(name)
-    if not isinstance(block, dict):
-        raise ProbeError("CONFIG_UNKNOWN_PROFILE", f"未知模型档案: {name}")
-    return dict(block)
+def _parse_models(raw: dict[str, Any]) -> dict[str, ModelEntry]:
+    """解析 models 段为 ModelEntry。"""
+    out: dict[str, ModelEntry] = {}
+    for name, block in raw.items():
+        if not isinstance(block, dict):
+            continue
+        # 跳过纯注释占位
+        model_id = _as_str(block.get("id") or block.get("model"))
+        family = _as_str(block.get("family"))
+        if not model_id or not family:
+            continue
+        roles_raw = block.get("roles") or []
+        if isinstance(roles_raw, str):
+            roles = frozenset({roles_raw})
+        else:
+            roles = frozenset(str(r) for r in roles_raw)
+        protocol = _as_str(block.get("protocol")) or _default_protocol(family)
+        out[str(name)] = ModelEntry(
+            name=str(name),
+            family=family.lower(),
+            model_id=model_id,
+            protocol=protocol,
+            roles=roles,
+            effort=_as_str(block.get("effort")),
+            headers=_as_str_dict(block.get("headers")),
+            model_config=dict(block.get("model_config") or {}),
+            auth=_as_str(block.get("auth")),
+            auth_header=_as_str(block.get("auth_header")),
+            auth_prefix=block.get("auth_prefix") if isinstance(block.get("auth_prefix"), str) else None,
+        )
+    return out
+
+
+def _default_protocol(family: str) -> str:
+    return {
+        "gpt": "responses",
+        "claude": "anthropic_messages",
+        "gemini": "gemini",
+    }.get(family.lower(), "responses")
+
+
+def _build_method_chain(
+    app: AppConfig,
+    method: str | None,
+    family: str | None,
+    fallback_methods: tuple[str, ...] | list[str],
+    catalog: dict[str, MethodSpec],
+    log: list[str],
+) -> list[str]:
+    """构造待尝试的方法有序列表。"""
+    chain: list[str] = []
+    if method:
+        chain.append(method)
+    else:
+        fam = (family or _as_str(app.runtime.get("default_family")) or "").lower()
+        if not fam:
+            # 有哪个家族就用哪个
+            configured = app.families()
+            for candidate in ("gpt", "claude", "gemini"):
+                if candidate in configured:
+                    fam = candidate
+                    break
+        if not fam:
+            raise ProbeError(
+                "FAMILY_NOT_CONFIGURED",
+                "未配置任何模型家族。请在 config.yaml 的 models 下添加至少一条模型。",
+            )
+        defaults = FAMILY_DEFAULT_METHODS.get(fam, ())
+        chain.extend(defaults)
+        log.append(f"default family={fam} methods={list(defaults)}")
+    for item in fallback_methods:
+        if item and item not in chain:
+            chain.append(item)
+    # 过滤未知稍后处理
+    return chain
+
+
+def _resolve_roles(
+    app: AppConfig,
+    spec: MethodSpec,
+    log: list[str],
+) -> tuple[dict[str, str], dict[str, str], dict[str, ModelEntry]]:
+    """为方法解析全部必需角色。"""
+    roles_spec = _apply_method_overrides(app, spec)
+    names: dict[str, str] = {}
+    ids: dict[str, str] = {}
+    entries: dict[str, ModelEntry] = {}
+    for role_name, need in roles_spec.items():
+        entry = _pick_model(app, spec.family, need, log, role_name)
+        if entry is None:
+            if need.required:
+                raise ProbeError(
+                    "ROLE_UNRESOLVED",
+                    f"方法 {spec.name} 无法解析角色 {role_name}（需要 capability={need.capability}，"
+                    f"prefer={list(need.prefer) or '任意'}）。"
+                    f"请在 models 中配置 family={spec.family} 且 roles 含 {need.capability} 的模型。",
+                    details={
+                        "method": spec.name,
+                        "role": role_name,
+                        "capability": need.capability,
+                        "prefer": list(need.prefer),
+                        "available": [
+                            m.name for m in app.models_for(spec.family, need.capability)
+                        ],
+                    },
+                )
+            continue
+        names[role_name] = entry.name
+        ids[role_name] = entry.model_id
+        entries[role_name] = entry
+    if "source" not in entries or "decoder" not in entries:
+        raise ProbeError(
+            "ROLE_UNRESOLVED",
+            f"方法 {spec.name} 缺少 source 或 decoder",
+            details={"resolved": names},
+        )
+    return names, ids, entries
+
+
+def _apply_method_overrides(app: AppConfig, spec: MethodSpec) -> dict[str, RoleNeed]:
+    """合并 config.methods.<name>.prefer 覆盖。"""
+    override = app.method_overrides.get(spec.name) or {}
+    prefer_map = override.get("prefer") or {}
+    roles = dict(spec.roles)
+    if isinstance(prefer_map, dict):
+        for role_name, prefer_list in prefer_map.items():
+            if role_name not in roles:
+                continue
+            if isinstance(prefer_list, str):
+                prefer_t = (prefer_list,)
+            else:
+                prefer_t = tuple(str(x) for x in prefer_list)
+            old = roles[role_name]
+            roles[role_name] = RoleNeed(old.capability, prefer=prefer_t, required=old.required)
+    return roles
+
+
+def _pick_model(
+    app: AppConfig,
+    family: str,
+    need: RoleNeed,
+    log: list[str],
+    role_name: str,
+) -> ModelEntry | None:
+    """按 prefer 链挑选模型。
+
+    - prefer 非空：只在 prefer 列表里找；全部未配置 → None（方法 unresolved，走 fallback）
+    - prefer 为空：任意具备 capability 的同家族模型
+    """
+    if need.prefer:
+        for name in need.prefer:
+            entry = app.models.get(name)
+            if entry is None:
+                log.append(f"  {role_name}: prefer {name} — not configured")
+                continue
+            if entry.family != family:
+                log.append(f"  {role_name}: prefer {name} — family mismatch")
+                continue
+            if need.capability not in entry.roles:
+                log.append(f"  {role_name}: prefer {name} — missing role {need.capability}")
+                continue
+            log.append(f"  {role_name}: picked {name} ({entry.model_id}) via prefer")
+            return entry
+        # prefer 写了但全落空：不静默换别的模型，让上层报 ROLE_UNRESOLVED
+        log.append(f"  {role_name}: all prefer failed {list(need.prefer)}")
+        return None
+
+    candidates = app.models_for(family, need.capability)
+    if candidates:
+        entry = candidates[0]
+        log.append(f"  {role_name}: picked {entry.name} ({entry.model_id}) via any-{need.capability}")
+        return entry
+    return None
+
+
+def _settings_for_roles(
+    app: AppConfig,
+    *,
+    family: str,
+    source: ModelEntry,
+    decoder: ModelEntry,
+    effort: str | None,
+    max_output_tokens: int | None,
+    timeout: float | None,
+    extra_headers: dict[str, str] | None,
+    model_config: dict[str, Any] | None,
+) -> Settings:
+    """由 source/decoder 模型条目合成 Settings。"""
+    protocol = source.protocol
+    protocol_block = dict(app.protocols.get(protocol) or {})
+
+    headers: dict[str, str] = {}
+    headers.update(app.upstream.headers)
+    headers.update(_as_str_dict(protocol_block.get("headers")))
+    headers.update(source.headers)
+    headers.update(decoder.headers)
+    if extra_headers:
+        headers.update(extra_headers)
+
+    auth = (
+        decoder.auth
+        or source.auth
+        or _as_str(protocol_block.get("auth"))
+        or app.upstream.auth
+        or "bearer"
+    ).lower()
+    auth_header = (
+        decoder.auth_header
+        or source.auth_header
+        or _as_str(protocol_block.get("auth_header"))
+        or app.upstream.auth_header
+    )
+    auth_prefix = (
+        decoder.auth_prefix
+        if decoder.auth_prefix is not None
+        else source.auth_prefix
+        if source.auth_prefix is not None
+        else protocol_block.get("auth_prefix", app.upstream.auth_prefix)
+    )
+    if auth_prefix is not None and not isinstance(auth_prefix, str):
+        auth_prefix = str(auth_prefix)
+
+    merged_mc: dict[str, Any] = {}
+    merged_mc.update(dict(protocol_block.get("model_config") or {}))
+    merged_mc.update(source.model_config)
+    merged_mc.update(decoder.model_config)
+    if model_config:
+        merged_mc.update(model_config)
+
+    resolved_effort = (
+        effort
+        or source.effort
+        or _as_str(app.runtime.get("effort"))
+        or "high"
+    )
+    resolved_max = (
+        max_output_tokens
+        if max_output_tokens is not None
+        else _as_int(app.runtime.get("max_output_tokens"), 4096)
+    )
+    resolved_timeout = (
+        timeout if timeout is not None else _as_float(app.runtime.get("timeout"), 120.0)
+    )
+
+    if not app.upstream.base_url:
+        raise ProbeError("CONFIG_MISSING_BASE_URL", "缺少 upstream.base_url")
+    if not app.upstream.api_key and auth != "none":
+        raise ProbeError("CONFIG_MISSING_API_KEY", "缺少 upstream.api_key")
+
+    return Settings(
+        base_url=app.upstream.base_url,
+        api_key=app.upstream.api_key,
+        source_model=source.model_id,
+        decoder_model=decoder.model_id,
+        protocol=protocol,
+        effort=resolved_effort,
+        max_output_tokens=resolved_max,
+        timeout=resolved_timeout,
+        model_config=merged_mc,
+        extra_headers=headers,
+        auth=auth,
+        auth_header=auth_header,
+        auth_prefix=auth_prefix,
+    )
+
+
+# ---- YAML 工具 ----
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -300,9 +609,13 @@ def _as_float(value: Any, default: float) -> float:
 def _as_str_dict(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
-    out: dict[str, str] = {}
-    for key, item in value.items():
-        if item is None:
-            continue
-        out[str(key)] = str(item)
-    return out
+    return {str(k): str(v) for k, v in value.items() if v is not None}
+
+
+# 兼容旧 import 名（逐步淘汰）
+def build_settings(*args: Any, **kwargs: Any) -> Settings:
+    """已废弃：请用 resolve_method_run。保留仅为过渡。"""
+    raise ProbeError(
+        "CONFIG_API_CHANGED",
+        "build_settings 已移除。请使用 resolve_method_run(app, method=...) 按模型骨架解析。",
+    )

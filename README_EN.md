@@ -73,37 +73,45 @@ cd sauna
 pip install pyyaml
 ```
 
-### 2. Configure upstream
+### 2. Configure upstream + model skeleton
 
 ```bash
 cp config.example.yaml config.yaml
 ```
 
-Edit `config.yaml` (**never committed**):
+Edit `config.yaml` (**never committed**). You declare **which models exist**, not a fixed source/decoder pair:
 
 ```yaml
 upstream:
   base_url: "https://your-upstream.example/v1"
   api_key: "sk-..."
-  auth: bearer          # bearer | x-api-key | header | none
-  headers:              # optional, gateway-specific
-    HTTP-Referer: "https://github.com/hahhforest/sauna"
+  headers:
     X-Title: "sauna-reasoning-recovery"
 
-defaults:
-  source_model: "gpt-5.6-sol"
-  decoder_model: "gpt-5.6-luna"
-  protocol: "responses"
+models:
+  sol:
+    family: gpt
+    id: gpt-5.6-sol
+    roles: [source]
+  luna:
+    family: gpt
+    id: gpt-5.6-luna
+    roles: [decoder]
+  terra:
+    family: gpt
+    id: gpt-5.6-terra
+    roles: [decoder, reconciler]
 ```
 
-> Env overrides: `UPSTREAM_BASE_URL` / `UPSTREAM_API_KEY`  
-> Does **not** read `~/.minimax` or other global agent configs.
+> Methods declare role deps (e.g. `gpt.luna_then_terra` needs luna). Missing models error and fall back.  
+> `python3 reasoning_probe.py --list-methods` shows what is runnable.  
+> Does **not** read `~/.minimax`.
 
 ### 3. One recovery run
 
 ```bash
 python3 reasoning_probe.py 'Compute 17 * 23 and give the final answer.'
-# Full JSON to stdout; add --output runs/one.json to persist
+python3 reasoning_probe.py --method gpt.single_replay --output runs/one.json '...'
 ```
 
 ### 4. Cross-provider matrix (optional)
