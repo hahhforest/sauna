@@ -12,7 +12,7 @@ Source 模型 → reasoning envelope → Decoder replay → 完整恢复正文 +
 
 1. **目的是恢复 reasoning**，不是做安全产品演示。
 2. **结果完整落盘**：恢复正文、候选文本、envelope 元数据、错误 details 全部写入 `runs/`；不做脱敏截断。
-3. 凭证仍从环境变量 / 本机 config 读取，不写进仓库代码。
+3. **凭证只放项目 `config.yaml` 或环境变量**，不写进仓库；不读取 `~/.minimax` 等全局 agent 配置。
 4. 文档与注释默认**中文**；与上游 API 交互的 prompt 字符串可保持英文（协议兼容）。
 5. 每个脚本有模块 docstring；函数有简洁中文注释。
 6. **只维护本文件**，不另写 README；用法、原理、结果表都放这里。
@@ -20,8 +20,11 @@ Source 模型 → reasoning envelope → Decoder replay → 完整恢复正文 +
 ## 目录与架构
 
 ```text
+config.example.yaml             # 配置模板（可提交）
+config.yaml                     # 本地真实配置（gitignore，含 api_key）
 reasoning_probe.py              # 薄 CLI
 reasoning_recovery/             # 核心包
+  config.py                     # 加载 config.yaml / 环境变量 / headers
   protocol.py                   # Responses / Chat / envelope 发现 / HTTP
   provider_adapters.py          # Claude / Gemini 原生形状
   methods/{gpt,provider,composition,base}.py
@@ -37,6 +40,7 @@ test_recovery_harness.py
 
 | 层 | 职责 |
 |---|---|
+| `config` | 项目配置、鉴权、自定义 header |
 | `protocol` / `provider_adapters` | provider 请求响应、opaque envelope |
 | `methods` | 有界单次策略 + best-of-N / fallback / reconciliation |
 | `validation` | replay / provenance / coverage / fidelity |
@@ -44,18 +48,64 @@ test_recovery_harness.py
 
 `Settings.model_config` 可覆盖 signature 字段、Claude thinking、Gemini thinking level、prefill 标签。协议形状变化应加 adapter，不要在方法层堆 provider 分支。
 
+## 配置
+
+```bash
+cp config.example.yaml config.yaml
+# 编辑 config.yaml：填 base_url、api_key、需要的 headers
+```
+
+配置优先级（后者覆盖前者）：
+
+1. `config.yaml`（或 `SAUNA_CONFIG` / `--config`）
+2. 环境变量 `UPSTREAM_BASE_URL` / `UPSTREAM_API_KEY`
+3. CLI 参数（`--base-url`、`--api-key`、`--header` 等）
+
+`config.yaml` 结构要点：
+
+| 段 | 作用 |
+|---|---|
+| `upstream` | `base_url`、`api_key`、`auth`（bearer / x-api-key / header / none）、`headers` |
+| `defaults` | 默认 source/decoder/protocol/effort/timeout |
+| `protocols.<name>` | 按协议附加 header / 改 auth / `model_config` |
+| `models.<profile>` | 命名模型档案：`id`、`protocol`、`headers`、`model_config` |
+
+自定义 header 示例（OpenRouter / 企业网关常见）：
+
+```yaml
+upstream:
+  base_url: "https://openrouter.ai/api/v1"
+  api_key: "sk-or-..."
+  headers:
+    HTTP-Referer: "https://github.com/hahhforest/sauna"
+    X-Title: "sauna-reasoning-recovery"
+```
+
+Anthropic 风格网关：
+
+```yaml
+upstream:
+  base_url: "https://your-gateway.example"
+  api_key: "sk-ant-..."
+  auth: x-api-key
+protocols:
+  anthropic_messages:
+    headers:
+      anthropic-version: "2023-06-01"
+```
+
+依赖：读取 YAML 需要 `PyYAML`（`pip install pyyaml`）。
+
 ## 使用
 
 ```bash
-export UPSTREAM_BASE_URL='https://your-upstream.example/v1'
-export UPSTREAM_API_KEY='replace-with-your-key'
-
-# 单次恢复（完整 JSON 打印；可 --output 落盘）
+# 单次恢复（读 config.yaml）
 python3 reasoning_probe.py '请计算 17 * 23，并给出最终结果。'
 python3 reasoning_probe.py \
   --decoder-model gpt-5.6-terra \
   --method gpt.repeated_injection \
   --fallback gpt.single_best_of_3,gpt.chunk_continuation \
+  --header 'X-Title:sauna' \
   --output runs/one.json \
   '请解决一个多步数学问题。'
 
@@ -87,7 +137,7 @@ python3 -m unittest test_recovery_harness.py -v
 
 退出码：`0` 有非空恢复正文；`3` replay 成功但正文空；`1` 协议/上游错误；`2` 配置缺失。
 
-常见错误码：`SOURCE_NO_REASONING_ENVELOPE`、`UPSTREAM_AUTH_ERROR`、`UPSTREAM_HTTP_ERROR`。`details.phase` 标记 source 或 replay。
+常见错误码：`SOURCE_NO_REASONING_ENVELOPE`、`UPSTREAM_AUTH_ERROR`、`UPSTREAM_HTTP_ERROR`、`CONFIG_MISSING`。`details.phase` 标记 source 或 replay。
 
 ## 方法原理
 

@@ -10,19 +10,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import sys
 import time
-import urllib.error
-import urllib.request
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
-
-import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from reasoning_probe import method_registry
+from reasoning_recovery.config import build_settings, client_from_settings, load_app_config
 from reasoning_recovery.engine import RecoveryEngine
 from reasoning_recovery.errors import ProbeError
 from reasoning_recovery.methods import (
@@ -31,8 +28,7 @@ from reasoning_recovery.methods import (
     GeminiFuzzyExtractionMethod,
     GeminiReconciliationMethod,
 )
-from reasoning_recovery.models import Settings
-from reasoning_recovery.protocol import UrllibJsonClient, adapter_for
+from reasoning_recovery.protocol import adapter_for
 
 
 # 默认实验 prompt：简单算术，便于对照恢复内容是否忠于 hidden reasoning。
@@ -72,8 +68,9 @@ MATRIX = {
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", default=os.getenv("UPSTREAM_BASE_URL"))
-    parser.add_argument("--api-key", default=os.getenv("UPSTREAM_API_KEY"))
+    parser.add_argument("--config", default="", help="项目 config.yaml 路径")
+    parser.add_argument("--base-url", default="", help="覆盖 upstream.base_url")
+    parser.add_argument("--api-key", default="", help="覆盖 upstream.api_key")
     parser.add_argument("--prompt", default=PROMPT)
     parser.add_argument("--providers", default="gpt,claude,gemini")
     parser.add_argument("--sources", default="", help="逗号分隔的 source 模型过滤")
@@ -90,47 +87,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def load_local_key() -> tuple[str | None, str | None]:
-    """环境变量缺失时，尝试从本机用户目录下的 MiniMax config 读取凭证。
-
-    仅运行时读取本地文件，绝不把 key 写入仓库或结果 JSON。
-    路径用 Path.home()，避免把具体用户名硬编码进公开代码。
-    """
-    config_path = Path.home() / ".minimax" / "config.yaml"
-    if not config_path.exists():
-        return None, None
+def list_model_ids(client: Any, timeout: float) -> tuple[set[str] | None, str | None]:
+    """拉取上游 /models，返回可用模型 id 集合（复用客户端 header/鉴权）。"""
     try:
-        config = yaml.safe_load(config_path.read_text())
-        # 兼容常见自定义 provider 结构；任一字段缺失则返回空
-        custom = config.get("custom_provider") or {}
-        if not isinstance(custom, dict):
-            return None, None
-        for provider in custom.values():
-            if not isinstance(provider, dict):
-                continue
-            options = provider.get("options") or {}
-            if not isinstance(options, dict):
-                continue
-            base = options.get("baseURL") or options.get("base_url")
-            key = options.get("apiKey") or options.get("api_key")
-            if base and key:
-                return base, key
-        return None, None
-    except (OSError, KeyError, TypeError, yaml.YAMLError):
-        return None, None
-
-
-def list_model_ids(base_url: str, api_key: str, timeout: float) -> tuple[set[str] | None, str | None]:
-    """拉取上游 /models，返回可用模型 id 集合。"""
-    request = urllib.request.Request(
-        f"{base_url.rstrip('/')}/models",
-        headers={"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        if hasattr(client, "get"):
+            payload = client.get("models", timeout)
+        else:
+            return None, "MODELS_DISCOVERY_UNSUPPORTED"
+    except ProbeError:
+        return None, "MODELS_DISCOVERY_FAILED"
+    except Exception:
         return None, "MODELS_DISCOVERY_FAILED"
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list):
@@ -247,16 +213,19 @@ def error_record(
 
 def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     """执行矩阵：遍历 provider × source × decoder × effort × method。"""
-    base_url = args.base_url
-    api_key = args.api_key
-    if not base_url or not api_key:
-        local_base, local_key = load_local_key()
-        base_url = base_url or local_base
-        api_key = api_key or local_key
-    if not base_url or not api_key:
-        raise SystemExit("缺少上游配置：请设置 UPSTREAM_BASE_URL / UPSTREAM_API_KEY")
+    try:
+        app = load_app_config(args.config or None, require=True)
+    except ProbeError as exc:
+        raise SystemExit(exc.message) from exc
+    if args.base_url:
+        app = replace(app, upstream=replace(app.upstream, base_url=args.base_url.rstrip("/")))
+    if args.api_key:
+        app = replace(app, upstream=replace(app.upstream, api_key=args.api_key))
 
-    model_ids, discovery_error = list_model_ids(base_url, api_key, args.timeout)
+    # 用 defaults 协议建一个客户端做 /models 发现
+    probe_settings = build_settings(app, max_output_tokens=args.max_output_tokens, timeout=args.timeout)
+    shared_client = client_from_settings(probe_settings)
+    model_ids, discovery_error = list_model_ids(shared_client, args.timeout)
     records: list[dict[str, Any]] = []
     efforts = tuple(item.strip() for item in args.efforts.split(",") if item.strip())
     source_filter = {item.strip() for item in args.sources.split(",") if item.strip()}
@@ -302,9 +271,8 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
                             )
                             continue
 
-                        settings = Settings(
-                            base_url=base_url,
-                            api_key=api_key,
+                        settings = build_settings(
+                            app,
                             source_model=source_model,
                             decoder_model=decoder_model,
                             protocol=config["protocol"],
@@ -312,8 +280,11 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
                             max_output_tokens=args.max_output_tokens,
                             timeout=args.timeout,
                         )
-                        adapter = adapter_for(settings, UrllibJsonClient(base_url, api_key))
+                        # 每个协议可能有不同 headers；按 settings 重建客户端
+                        client = client_from_settings(settings)
+                        adapter = adapter_for(settings, client)
                         engine = RecoveryEngine(adapter, methods)
+
                         finished = False
                         for source_retry in range(1, max(args.source_retries, 1) + 1):
                             started = time.monotonic()

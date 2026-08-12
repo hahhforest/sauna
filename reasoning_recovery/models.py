@@ -20,6 +20,12 @@ class Settings:
     timeout: float = 120.0
     # 模型相关扩展：signature 字段名、prefill 标签、thinking 配置等
     model_config: dict[str, Any] = field(default_factory=dict)
+    # 自定义 HTTP header（OpenRouter Referer、anthropic-version 等）
+    extra_headers: dict[str, str] = field(default_factory=dict)
+    # 鉴权：bearer | x-api-key | header | none
+    auth: str = "bearer"
+    auth_header: str | None = None
+    auth_prefix: str | None = None
 
 
 @dataclass(frozen=True)

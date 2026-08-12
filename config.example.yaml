@@ -1,0 +1,83 @@
+# 复制为本目录下的 config.yaml 后填写真实值：
+#   cp config.example.yaml config.yaml
+#
+# config.yaml 已在 .gitignore，不会提交到 GitHub。
+# 环境变量仍可覆盖同名字段（便于 CI / 临时切换）：
+#   UPSTREAM_BASE_URL / UPSTREAM_API_KEY / SAUNA_CONFIG
+
+# ---------- 上游网关（必填）----------
+upstream:
+  # OpenAI 兼容根路径，通常以 /v1 结尾
+  base_url: "https://your-upstream.example/v1"
+
+  # API 密钥。也可用环境变量 UPSTREAM_API_KEY 覆盖
+  api_key: "replace-with-your-key"
+
+  # 鉴权方式：
+  #   bearer   -> Authorization: Bearer <api_key>（默认，OpenAI / 多数网关）
+  #   x-api-key -> x-api-key: <api_key>（部分 Anthropic 风格网关）
+  #   header   -> 使用 auth_header + 可选 auth_prefix
+  #   none     -> 不自动塞 key（仅靠下方 headers）
+  auth: bearer
+
+  # auth: header 时使用，例如：
+  # auth_header: "Authorization"
+  # auth_prefix: "Bearer "          # 注意末尾空格；也可写成 "Token "
+
+  # 每次请求都会附带的自定义 header（OpenRouter / 企业网关常用）
+  # 不要在这里写密钥进公开仓库；本地 config.yaml 可以写
+  headers:
+    # HTTP-Referer: "https://github.com/your-org/sauna"
+    # X-Title: "sauna-reasoning-recovery"
+    # anthropic-version: "2023-06-01"
+    # OpenAI-Organization: "org-xxx"
+    # X-Sub-Module: "your-internal-route"
+
+# ---------- 运行默认值（可被 CLI 覆盖）----------
+defaults:
+  source_model: "gpt-5.6-sol"
+  decoder_model: "gpt-5.6-luna"
+  # responses | chat_completions | anthropic_messages | gemini
+  protocol: "responses"
+  effort: "high"
+  max_output_tokens: 4096
+  timeout: 120.0
+
+# ---------- 按协议附加的 header / model_config ----------
+# 在 upstream.headers 之上合并；同名键以本段为准
+protocols:
+  responses: {}
+  chat_completions: {}
+  anthropic_messages:
+    headers:
+      # anthropic-version: "2023-06-01"
+    # 也可改鉴权：auth: x-api-key
+  gemini: {}
+
+# ---------- 命名模型档案（可选）----------
+# CLI 可用 --source-profile / --decoder-profile 引用
+models:
+  # gpt_sol:
+  #   id: "gpt-5.6-sol"
+  #   protocol: responses
+  #   effort: high
+  #   model_config:
+  #     signature_fields: ["encrypted_content"]
+  #
+  # claude_opus:
+  #   id: "claude-opus-4-8"
+  #   protocol: anthropic_messages
+  #   headers:
+  #     anthropic-version: "2023-06-01"
+  #   model_config:
+  #     prefill_tag: "<thinking-copy>"
+  #     thinking:
+  #       type: adaptive
+  #       display: omitted
+  #
+  # gemini_pro:
+  #   id: "gemini-3.1-pro-preview"
+  #   protocol: gemini
+  #   model_config:
+  #     prefill_tag: "<thought>"
+  #     thinking_level_field: "thinkingLevel"

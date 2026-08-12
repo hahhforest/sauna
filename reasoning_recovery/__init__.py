@@ -5,6 +5,7 @@
 不启动 Web 服务，不持久化凭证。
 """
 
+from .config import AppConfig, UpstreamConfig, build_settings, load_app_config
 from .engine import RecoveryEngine
 from .errors import ProbeError
 from .models import (
@@ -19,6 +20,7 @@ from .models import (
 )
 
 __all__ = [
+    "AppConfig",
     "AttemptRecord",
     "DimensionResult",
     "Envelope",
@@ -29,4 +31,7 @@ __all__ = [
     "RecoveryEngine",
     "RecoveryResult",
     "Settings",
+    "UpstreamConfig",
+    "build_settings",
+    "load_app_config",
 ]

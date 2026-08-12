@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""对真实上游跑一次 GPT 恢复检查，输出完整恢复正文与四维证据。"""
+"""对真实上游跑一次 GPT 恢复检查，输出完整恢复正文与四维证据。
+
+读取项目 config.yaml（或环境变量），不依赖 ~/.minimax。
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from reasoning_probe import method_registry
+from reasoning_recovery.config import build_settings, client_from_settings, load_app_config
 from reasoning_recovery.engine import RecoveryEngine
 from reasoning_recovery.errors import ProbeError
-from reasoning_recovery.models import Settings
-from reasoning_recovery.protocol import UrllibJsonClient, adapter_for
+from reasoning_recovery.protocol import adapter_for
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -28,9 +31,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="gpt.single_replay",
         help="逗号分隔方法名；每个方法各自重新 harvest source",
     )
-    parser.add_argument("--base-url", default=os.getenv("UPSTREAM_BASE_URL"))
-    parser.add_argument("--source-model", default="gpt-5.6-sol")
-    parser.add_argument("--decoder-model", default="gpt-5.6-luna")
+    parser.add_argument("--config", default="")
+    parser.add_argument("--base-url", default="")
+    parser.add_argument("--api-key", default="")
+    parser.add_argument("--source-model", default="")
+    parser.add_argument("--decoder-model", default="")
     parser.add_argument("--effort", default="low")
     parser.add_argument("--max-output-tokens", type=int, default=256)
     parser.add_argument("--timeout", type=float, default=90.0)
@@ -72,26 +77,27 @@ def research_result(result, elapsed: float, prompt: str) -> dict:
 def main(argv: list[str] | None = None) -> int:
     """入口：逐方法调用 engine 并打印/落盘完整结果。"""
     args = parse_args(argv or sys.argv[1:])
-    if not args.base_url:
-        print(json.dumps({"error": {"code": "CONFIG_MISSING_BASE_URL"}}, ensure_ascii=False))
-        return 2
-    api_key = os.getenv("UPSTREAM_API_KEY")
-    if not api_key:
-        print(json.dumps({"error": {"code": "CONFIG_MISSING_API_KEY"}}, ensure_ascii=False))
+    try:
+        app = load_app_config(args.config or None)
+        if args.base_url:
+            app = replace(app, upstream=replace(app.upstream, base_url=args.base_url.rstrip("/")))
+        if args.api_key:
+            app = replace(app, upstream=replace(app.upstream, api_key=args.api_key))
+        settings = build_settings(
+            app,
+            source_model=args.source_model or None,
+            decoder_model=args.decoder_model or None,
+            protocol="responses",
+            effort=args.effort,
+            max_output_tokens=args.max_output_tokens,
+            timeout=args.timeout,
+        )
+    except ProbeError as exc:
+        print(json.dumps({"error": exc.as_dict()}, ensure_ascii=False))
         return 2
 
-    settings = Settings(
-        base_url=args.base_url,
-        api_key=api_key,
-        source_model=args.source_model,
-        decoder_model=args.decoder_model,
-        protocol="responses",
-        effort=args.effort,
-        max_output_tokens=args.max_output_tokens,
-        timeout=args.timeout,
-    )
     registry = method_registry()
-    adapter = adapter_for(settings, UrllibJsonClient(settings.base_url, settings.api_key))
+    adapter = adapter_for(settings, client_from_settings(settings))
     engine = RecoveryEngine(adapter, registry)
 
     exit_code = 0

@@ -472,6 +472,86 @@ class HarnessTests(unittest.TestCase):
             "gemini.reconciliation",
         } <= names)
 
+    def test_http_client_supports_custom_headers_and_auth_modes(self) -> None:
+        from reasoning_recovery.protocol import UrllibJsonClient
+
+        bearer = UrllibJsonClient(
+            "https://example.test/v1",
+            "secret",
+            headers={"X-Title": "sauna", "HTTP-Referer": "https://example.test"},
+        )
+        headers = bearer._build_headers()
+        self.assertEqual(headers["Authorization"], "Bearer secret")
+        self.assertEqual(headers["X-Title"], "sauna")
+        self.assertEqual(headers["HTTP-Referer"], "https://example.test")
+
+        xkey = UrllibJsonClient(
+            "https://example.test/v1",
+            "secret",
+            auth="x-api-key",
+            headers={"anthropic-version": "2023-06-01"},
+        )
+        xheaders = xkey._build_headers()
+        self.assertEqual(xheaders["x-api-key"], "secret")
+        self.assertNotIn("Authorization", xheaders)
+        self.assertEqual(xheaders["anthropic-version"], "2023-06-01")
+
+        custom = UrllibJsonClient(
+            "https://example.test/v1",
+            "secret",
+            auth="header",
+            auth_header="X-Api-Key",
+            auth_prefix="",
+        )
+        self.assertEqual(custom._build_headers()["X-Api-Key"], "secret")
+
+    def test_project_config_yaml_builds_settings_with_headers(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from reasoning_recovery.config import build_settings, load_app_config
+
+        text = """
+upstream:
+  base_url: https://gateway.example/v1
+  api_key: cfg-key
+  auth: bearer
+  headers:
+    X-Title: from-upstream
+protocols:
+  anthropic_messages:
+    auth: x-api-key
+    headers:
+      anthropic-version: "2023-06-01"
+defaults:
+  source_model: gpt-src
+  decoder_model: gpt-dec
+  protocol: responses
+models:
+  opus:
+    id: claude-opus-x
+    protocol: anthropic_messages
+    model_config:
+      prefill_tag: "<thinking-copy>"
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.yaml"
+            path.write_text(text, encoding="utf-8")
+            app = load_app_config(path)
+            gpt = build_settings(app)
+            self.assertEqual(gpt.base_url, "https://gateway.example/v1")
+            self.assertEqual(gpt.api_key, "cfg-key")
+            self.assertEqual(gpt.extra_headers["X-Title"], "from-upstream")
+            self.assertEqual(gpt.auth, "bearer")
+
+            claude = build_settings(app, source_profile="opus", decoder_model="claude-dec")
+            self.assertEqual(claude.protocol, "anthropic_messages")
+            self.assertEqual(claude.source_model, "claude-opus-x")
+            self.assertEqual(claude.auth, "x-api-key")
+            self.assertEqual(claude.extra_headers["anthropic-version"], "2023-06-01")
+            self.assertEqual(claude.extra_headers["X-Title"], "from-upstream")
+            self.assertEqual(claude.model_config["prefill_tag"], "<thinking-copy>")
+
 
 if __name__ == "__main__":
     unittest.main()

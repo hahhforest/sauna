@@ -120,24 +120,73 @@ class JsonClient(Protocol):
 
 
 class UrllibJsonClient:
-    """无第三方依赖的 JSON 客户端；错误详情完整保留供研究排障。"""
+    """无第三方依赖的 JSON 客户端；支持自定义 header 与多种鉴权。"""
 
-    def __init__(self, base_url: str, api_key: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "",
+        *,
+        headers: dict[str, str] | None = None,
+        auth: str = "bearer",
+        auth_header: str | None = None,
+        auth_prefix: str | None = None,
+    ) -> None:
+        """初始化客户端。
+
+        Args:
+            base_url: 上游根 URL（通常含 /v1）。
+            api_key: 密钥；auth=none 时可为空。
+            headers: 附加自定义 header。
+            auth: bearer | x-api-key | header | none。
+            auth_header: auth=header 时的 header 名。
+            auth_prefix: auth=header 时的值前缀（如 'Bearer '）。
+        """
         self.base_url = base_url
         self.api_key = api_key
+        self.extra_headers = dict(headers or {})
+        self.auth = (auth or "bearer").lower()
+        self.auth_header = auth_header
+        self.auth_prefix = auth_prefix
+
+    def _build_headers(self, *, content_type: str | None = "application/json") -> dict[str, str]:
+        """合并默认头、鉴权头与自定义头（自定义同名键覆盖默认）。"""
+        headers: dict[str, str] = {"Accept": "application/json"}
+        if content_type:
+            headers["Content-Type"] = content_type
+        if self.auth == "bearer" and self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        elif self.auth == "x-api-key" and self.api_key:
+            headers["x-api-key"] = self.api_key
+        elif self.auth == "header" and self.api_key:
+            name = self.auth_header or "Authorization"
+            prefix = self.auth_prefix if self.auth_prefix is not None else "Bearer "
+            headers[name] = f"{prefix}{self.api_key}"
+        # none：不自动写 key
+        headers.update(self.extra_headers)
+        return headers
+
+    def get(self, path: str, timeout: float) -> dict[str, Any]:
+        """GET JSON（用于 /models 等）。"""
+        request = urllib.request.Request(
+            _join_url(self.base_url, path),
+            headers=self._build_headers(content_type=None),
+            method="GET",
+        )
+        return self._send(request, timeout)
 
     def post(self, path: str, body: dict[str, Any], timeout: float) -> dict[str, Any]:
         """POST JSON 并返回解析后的对象。"""
         request = urllib.request.Request(
             _join_url(self.base_url, path),
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
+            headers=self._build_headers(),
             method="POST",
         )
+        return self._send(request, timeout)
+
+    def _send(self, request: urllib.request.Request, timeout: float) -> dict[str, Any]:
+        """发送请求并统一错误处理。"""
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read()

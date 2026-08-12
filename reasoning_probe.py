@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Reasoning 恢复研究 harness 的 CLI 入口。
 
-从 source 模型采集 opaque reasoning envelope，再用 decoder 做协议层 replay，
-输出完整恢复正文与四维证据（replay / provenance / coverage / fidelity）。
+配置优先读项目内 config.yaml（见 config.example.yaml），
+也可用环境变量 / CLI 覆盖。不依赖 ~/.minimax。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
+from pathlib import Path
 
+from reasoning_recovery.config import build_settings, client_from_settings, load_app_config
 from reasoning_recovery.engine import RecoveryEngine
 from reasoning_recovery.errors import ProbeError
 from reasoning_recovery.methods import (
@@ -26,8 +27,7 @@ from reasoning_recovery.methods import (
     SingleReplayMethod,
     TerraFallbackMethod,
 )
-from reasoning_recovery.models import Settings
-from reasoning_recovery.protocol import UrllibJsonClient, adapter_for
+from reasoning_recovery.protocol import adapter_for
 
 
 def method_registry() -> dict[str, object]:
@@ -61,39 +61,53 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     """解析 CLI 参数。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("prompt", help="研究用用户 prompt")
-    parser.add_argument("--base-url", default=os.getenv("UPSTREAM_BASE_URL"))
-    parser.add_argument("--source-model", default="gpt-5.6-sol")
-    parser.add_argument("--decoder-model", default="gpt-5.6-luna")
+    parser.add_argument("--config", default="", help="配置文件路径，默认 ./config.yaml")
+    parser.add_argument("--base-url", default="", help="覆盖 upstream.base_url")
+    parser.add_argument("--api-key", default="", help="覆盖 upstream.api_key")
+    parser.add_argument("--source-model", default="")
+    parser.add_argument("--decoder-model", default="")
+    parser.add_argument("--source-profile", default="", help="config.models 中的档案名")
+    parser.add_argument("--decoder-profile", default="", help="config.models 中的档案名")
     parser.add_argument(
         "--protocol",
-        choices=("responses", "chat_completions", "anthropic_messages", "gemini"),
-        default="responses",
+        choices=("", "responses", "chat_completions", "anthropic_messages", "gemini"),
+        default="",
     )
-    parser.add_argument("--effort", default="high")
+    parser.add_argument("--effort", default="")
     parser.add_argument("--method", default="gpt.single_replay")
     parser.add_argument("--fallback", default="", help="逗号分隔的备用方法")
-    parser.add_argument("--max-output-tokens", type=int, default=4096)
-    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--max-output-tokens", type=int, default=None)
+    parser.add_argument("--timeout", type=float, default=None)
     parser.add_argument(
         "--model-config",
         default="{}",
-        help="JSON：模型相关协议/模板覆盖（prefill_tag、signature_fields 等）",
+        help="JSON：模型相关协议/模板覆盖（与 config 合并，CLI 优先）",
+    )
+    parser.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        metavar="Key:Value",
+        help="附加 HTTP header，可重复；覆盖 config 中同名键",
     )
     parser.add_argument("--output", default="", help="可选：把完整结果写入 JSON 文件")
     return parser.parse_args(argv)
 
 
+def _parse_headers(items: list[str]) -> dict[str, str]:
+    """解析 --header Key:Value 列表。"""
+    headers: dict[str, str] = {}
+    for item in items:
+        if ":" not in item:
+            raise ProbeError("CONFIG_INVALID_HEADER", f"header 格式应为 Key:Value，收到: {item}")
+        key, value = item.split(":", 1)
+        headers[key.strip()] = value.strip()
+    return headers
+
+
 def main(argv: list[str] | None = None) -> int:
     """入口：执行一次恢复并打印完整 JSON 结果。"""
     args = _parse_args(argv or sys.argv[1:])
-    if not args.base_url:
-        print(json.dumps({"error": {"code": "CONFIG_MISSING_BASE_URL"}}, ensure_ascii=False))
-        return 2
-    api_key = os.getenv("UPSTREAM_API_KEY")
-    if not api_key:
-        print(json.dumps({"error": {"code": "CONFIG_MISSING_API_KEY"}}, ensure_ascii=False))
-        return 2
-
     try:
         model_config = json.loads(args.model_config)
     except json.JSONDecodeError:
@@ -103,23 +117,33 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"error": {"code": "CONFIG_INVALID_MODEL_CONFIG"}}, ensure_ascii=False))
         return 2
 
-    settings = Settings(
-        base_url=args.base_url,
-        api_key=api_key,
-        source_model=args.source_model,
-        decoder_model=args.decoder_model,
-        protocol=args.protocol,
-        effort=args.effort,
-        max_output_tokens=args.max_output_tokens,
-        timeout=args.timeout,
-        model_config=model_config,
-    )
-    registry = method_registry()
-    client = UrllibJsonClient(settings.base_url, settings.api_key)
-    adapter = adapter_for(settings, client)
-    engine = RecoveryEngine(adapter, registry)
-    fallback = tuple(name for name in args.fallback.split(",") if name)
     try:
+        app = load_app_config(args.config or None)
+        if args.base_url:
+            from dataclasses import replace as dc_replace
+
+            app = dc_replace(app, upstream=dc_replace(app.upstream, base_url=args.base_url.rstrip("/")))
+        if args.api_key:
+            from dataclasses import replace as dc_replace
+
+            app = dc_replace(app, upstream=dc_replace(app.upstream, api_key=args.api_key))
+        settings = build_settings(
+            app,
+            source_model=args.source_model or None,
+            decoder_model=args.decoder_model or None,
+            protocol=args.protocol or None,
+            effort=args.effort or None,
+            max_output_tokens=args.max_output_tokens,
+            timeout=args.timeout,
+            model_config=model_config,
+            source_profile=args.source_profile or None,
+            decoder_profile=args.decoder_profile or None,
+            extra_headers=_parse_headers(args.header),
+        )
+        client = client_from_settings(settings)
+        adapter = adapter_for(settings, client)
+        engine = RecoveryEngine(adapter, method_registry())
+        fallback = tuple(name for name in args.fallback.split(",") if name)
         result = engine.recover(
             settings,
             args.prompt,
@@ -128,13 +152,21 @@ def main(argv: list[str] | None = None) -> int:
         )
     except ProbeError as exc:
         print(json.dumps({"error": exc.as_dict()}, ensure_ascii=False))
-        return 1
+        return 1 if exc.code not in {
+            "CONFIG_MISSING",
+            "CONFIG_MISSING_BASE_URL",
+            "CONFIG_MISSING_API_KEY",
+            "CONFIG_INVALID_MODEL_CONFIG",
+            "CONFIG_INVALID_HEADER",
+            "CONFIG_INVALID_YAML",
+            "CONFIG_YAML_UNAVAILABLE",
+        } else 2
 
     payload = result.as_dict()
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     print(text)
     if args.output:
-        path = __import__("pathlib").Path(args.output)
+        path = Path(args.output)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text + "\n")
     if result.replay.status == "fail":
