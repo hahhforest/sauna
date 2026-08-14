@@ -6,3 +6,6 @@ __pycache__/
 config.yaml
 runs/
 *.jsonl
+
+# macOS
+.DS_Store

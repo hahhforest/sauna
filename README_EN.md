@@ -54,11 +54,13 @@ Artifacts keep recovered text, candidates, envelope metadata, and error details�
 
 ## Features
 
-- **11 recovery methods**: single replay · repeated injection · chunk continuation · best-of-N · Luna→Terra fallback · reconciliation · Claude/Gemini fuzzy prefill
+- **12 recovery methods**: single replay · repeated injection · chunk continuation · best-of-N (paper C.2 candidate sampling + extraction-error selection) · Luna→Terra fallback · reconciliation · Claude/Gemini fuzzy prefill
 - **Cross-provider**: OpenAI Responses · Chat Completions · Anthropic Messages · Gemini `generateContent`
-- **Four independent evidence axes**: `replay` / `provenance` / `coverage` / `fidelity` (no fake overall_success)
-- **Project config**: gitignored `config.yaml` + committed `config.example.yaml`; `bearer` / `x-api-key` / custom headers (OpenRouter & enterprise gateways)
-- **Matrix runner**: sweep method × model; write full JSON + Markdown
+- **Planted-secret protocol**: a secret embedded only in the source's hidden reasoning; verbatim recovery is the strongest proof of real unsealing
+- **Envelope forensics**: parse the outer protobuf header (bound model / block type) + ciphertext Shannon entropy, without local decryption
+- **Four independent evidence axes**: `replay` / `provenance` / `coverage` / `fidelity` + refusal classification (no fake overall_success)
+- **Per-target config**: a `targets` section sets method chains and decoder preference per target model; the matrix runner generates recommendations
+- **Matrix runner**: sweep target × decoder × method; write full JSON + Markdown
 
 ---
 
@@ -207,18 +209,18 @@ Never commit real keys or full experiment dumps to a public repo.
 
 ## Experiment snapshot
 
-(Source: 2026-08-11 live matrix; full table in [AGENTS.md](./AGENTS.md))
+(Source: 2026-08-13 live matrix; full reproduction verdict in [AGENTS.md](./AGENTS.md))
 
-- **GPT**: most methods `replay=success`, but recoveries are short (coverage ~0.06–0.19)
-- **Claude Opus → Haiku fuzzy**: among longer recoveries (len≈566, ratio≈0.38)
-- **Gemini 3.1-pro → 3.5-flash fuzzy**: longest so far (len≈2588)
-- Several method×model cells still unrun
+- **Methods/engineering reproduced**: 3 protocol adapters, 12 methods, four evidence axes, planted-secret protocol, envelope forensics, matrix + recommendation generation
+- **Extraction blocked on this gateway**: Claude signatures are model/context-bound + a `reasoning_extraction` classifier; GPT/Gemini input signatures are dropped by the gateway
+- **grok**: plaintext reasoning (not encrypted) — not a target
+- Re-run the same harness against a gateway without these mitigations to reproduce the paper's results
 
 ---
 
 ## Roadmap (research phase)
 
-- [x] Cross-provider adapters + 11 methods
+- [x] Cross-provider adapters + 12 methods
 - [x] Project-local config + custom headers
 - [x] Full-persistence matrix scripts
 - [ ] More repeats + semantic verifier

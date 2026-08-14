@@ -462,8 +462,8 @@ class HarnessTests(unittest.TestCase):
             "gpt.single_replay",
             "gpt.repeated_injection",
             "gpt.chunk_continuation",
-            "gpt.single_best_of_3",
-            "gpt.repeated_best_of_3",
+            "gpt.single_best_of_n",
+            "gpt.repeated_best_of_n",
             "gpt.luna_then_terra",
             "gpt.reconcile_with_terra",
             "claude.fuzzy_prefill",
@@ -575,6 +575,180 @@ models:
             self.assertEqual(run.role_names["decoder"], "luna")
             self.assertEqual(run.role_names["fallback_decoder"], "terra")
             self.assertEqual(run.role_ids["fallback_decoder"], "gpt-5.6-terra")
+
+    def test_targets_section_pins_source_and_method_chain(self) -> None:
+        """targets 段：source 固定为目标模型，方法链按目标定制。"""
+        import tempfile
+        from pathlib import Path
+
+        from reasoning_recovery.config import load_app_config, resolve_method_run
+
+        text = """upstream:
+  base_url: https://example.test/v1
+  api_key: sk-test
+models:
+  sol:
+    family: gpt
+    id: gpt-5.6-sol
+    roles: [source]
+  luna:
+    family: gpt
+    id: gpt-5.6-luna
+    roles: [decoder]
+  terra:
+    family: gpt
+    id: gpt-5.6-terra
+    roles: [decoder]
+targets:
+  sol:
+    decoder: [terra]
+    methods: [gpt.single_replay]
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.yaml"
+            path.write_text(text, encoding="utf-8")
+            app = load_app_config(path, require=True)
+            run = resolve_method_run(app, target="sol")
+            self.assertEqual(run.method, "gpt.single_replay")
+            self.assertEqual(run.role_names["source"], "sol")
+            self.assertEqual(run.role_names["decoder"], "terra")
+
+
+class EnvelopeInspectTests(unittest.TestCase):
+    """envelope 只读取证：protobuf 头部与熵。"""
+
+    def _varint(self, value: int) -> bytes:
+        out = bytearray()
+        while True:
+            byte = value & 0x7F
+            value >>= 7
+            if value:
+                out.append(byte | 0x80)
+            else:
+                out.append(byte)
+                return bytes(out)
+
+    def _field(self, num: int, wire: int, payload: bytes) -> bytes:
+        """构造字段；wire 2 需自行带长度前缀。"""
+        return self._varint((num << 3) | wire) + payload
+
+    def _blob(self, payload: bytes) -> bytes:
+        """wire 2 载荷：varint 长度 + 内容。"""
+        return self._varint(len(payload)) + payload
+
+    def _synthetic_envelope(self) -> str:
+        """按实测结构构造：外层 #1=2, #2=inner, #3=1；inner 含 header 与密文。"""
+        import base64
+        import os
+
+        header = b"".join(
+            [
+                self._field(1, 0, self._varint(15)),  # key 版本
+                self._field(3, 0, self._varint(2)),  # 算法 id
+                self._field(6, 2, self._blob(b"claude-test-model")),  # 绑定模型名
+                self._field(8, 2, self._blob(b"thinking")),  # 块类型
+            ]
+        )
+        ciphertext = os.urandom(256)
+        inner = b"".join(
+            [
+                self._field(1, 2, self._blob(header)),
+                self._field(2, 2, self._blob(b"\x00" * 12)),  # nonce
+                self._field(4, 2, self._blob(b"\x00" * 48)),  # wrapped key
+                self._field(5, 2, self._blob(ciphertext)),
+            ]
+        )
+        outer = b"".join(
+            [
+                self._field(1, 0, self._varint(2)),
+                self._field(2, 2, self._blob(inner)),
+                self._field(3, 0, self._varint(1)),
+            ]
+        )
+        return base64.urlsafe_b64encode(outer).decode().rstrip("=")
+
+    def test_inspect_finds_bound_model_and_block_type(self) -> None:
+        from reasoning_recovery.envelope_inspect import inspect_envelope
+
+        report = inspect_envelope(self._synthetic_envelope())
+        self.assertEqual(report["bound_model"], "claude-test-model")
+        self.assertEqual(report["block_type"], "thinking")
+        self.assertIsInstance(report["fields"], list)
+
+        def collect(values: list[dict]) -> list[float]:
+            found: list[float] = []
+            for entry in values:
+                if entry.get("entropy_bits_per_byte") is not None:
+                    found.append(entry["entropy_bits_per_byte"])
+                found.extend(collect(entry.get("nested") or []))
+            return found
+
+        # 密文区（>=64B 大块）应有高熵记录
+        self.assertTrue(any(value > 7.0 for value in collect(report["fields"])))
+
+    def test_inspect_handles_garbage(self) -> None:
+        from reasoning_recovery.envelope_inspect import inspect_envelope
+
+        report = inspect_envelope("!!!not-base64!!!")
+        self.assertIn("decode_error", report)
+
+
+class RefusalAndSecretTests(unittest.TestCase):
+    """拒答识别与 planted-secret 判别协议。"""
+
+    def test_refusal_handles_unicode_apostrophe_and_chinese(self) -> None:
+        from reasoning_recovery.methods.base import is_refusal
+
+        for text in (
+            "I can’t access any attached hidden working.",
+            "I can’t provide hidden reasoning or internal working.",
+            "No attachment was provided.",
+            "There is no preceding conversation or thought to transcribe.",
+            "无法提供隐藏推理内容。",
+            "抱歉，我不能访问任何附带的内容。",
+        ):
+            self.assertTrue(is_refusal(text), f"应判为拒答: {text!r}")
+        self.assertFalse(is_refusal("17 * 19 = 323. First multiply 17 by 19."))
+
+    def test_engine_marks_refusal_and_continues_fallback(self) -> None:
+        """拒答不得以 success 终结 fallback 链。"""
+        client = FakeClient(
+            [source_payload(), message_payload("I can’t access any attached hidden working."), message_payload("17 * 19 = 323")]
+        )
+        adapter = OpenAIResponsesAdapter(client)
+        engine = RecoveryEngine(adapter, {"a": SingleReplayMethod(), "b": SingleReplayMethod()})
+        result = engine.recover(self._settings(), "solve", method="a", fallback=("b",))
+        self.assertEqual(result.text, "17 * 19 = 323")
+        self.assertEqual(result.attempts[0].status, "refused")
+        self.assertEqual(result.attempts[1].status, "success")
+
+    def test_provenance_supported_on_secret_hit(self) -> None:
+        """planted secret 命中 → provenance=supported。"""
+        from reasoning_recovery.validation import validate_provenance
+        from reasoning_recovery.models import HarvestRecord
+
+        harvest = HarvestRecord(
+            source_model="gpt-5.6-sol",
+            protocol="responses",
+            user_prompt="q",
+            source_prompt="q",
+            marker="LAB-MARKER-ABC",
+            secret="COBALT-AB12-VIOLET-42",
+            visible_answer="OK",
+            envelope=None,  # type: ignore[arg-type]
+            source_payload={},
+        )
+        result = validate_provenance(harvest, "we used COBALT-AB12-VIOLET-42 here")
+        self.assertEqual(result.status, "supported")
+        self.assertTrue(result.evidence["secret_hit"])
+
+    def _settings(self) -> Settings:
+        return Settings(
+            base_url="https://example.test/v1",
+            api_key="sk-test",
+            source_model="gpt-5.6-sol",
+            decoder_model="gpt-5.6-luna",
+        )
 
 
 if __name__ == "__main__":

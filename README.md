@@ -54,11 +54,13 @@ Decoder 模型 ──协议 replay / prefill──▶  可见恢复正文
 
 ## 特性一览
 
-- **11 种恢复方法**：single replay · repeated injection · chunk continuation · best-of-N · Luna→Terra fallback · reconciliation · Claude/Gemini fuzzy prefill
+- **12 种恢复方法**：single replay · repeated injection · chunk continuation · best-of-N（论文 C.2 候选采样 + extraction error 选择）· Luna→Terra fallback · reconciliation · Claude/Gemini fuzzy prefill
 - **跨 provider**：OpenAI Responses · Chat Completions · Anthropic Messages · Gemini `generateContent`
-- **四维证据**：`replay` / `provenance` / `coverage` / `fidelity` 独立评分，不合成虚假 overall_success
-- **项目级配置**：`config.yaml`（gitignore）+ `config.example.yaml`；支持 `bearer` / `x-api-key` / 自定义 header（OpenRouter、企业网关友好）
-- **矩阵实验脚本**：一键扫 method × model，JSON + Markdown 完整落盘
+- **planted-secret 判别协议**：秘密只埋进 source hidden reasoning，恢复正文逐字符命中 = 真解封的强证据
+- **envelope 只读取证**：protobuf 外层头部解析（绑定模型名 / 块类型）+ 密文 Shannon 熵，本地不解密
+- **四维证据**：`replay` / `provenance` / `coverage` / `fidelity` 独立评分 + 拒答分类，不合成虚假 overall_success
+- **按目标的配置**：`targets` 段为每个目标模型定制方法链与 decoder 偏好，矩阵实验自动生成推荐
+- **矩阵实验脚本**：target × decoder × method 一键扫描，JSON + Markdown 完整落盘
 
 ---
 
@@ -209,12 +211,12 @@ python3 -m unittest test_recovery_harness.py -v
 
 ## 当前实验速览
 
-（数据：2026-08-11 实网矩阵；细节与完整表见 [AGENTS.md](./AGENTS.md)）
+（数据：2026-08-13 实网矩阵；完整复现结论见 [AGENTS.md](./AGENTS.md)）
 
-- **GPT**：各方法多可 `replay=success`，但恢复偏短（coverage ~0.06–0.19）
-- **Claude Opus → Haiku fuzzy**：较长恢复之一（len≈566，ratio≈0.38）
-- **Gemini 3.1-pro → 3.5-flash fuzzy**：目前最长（len≈2588）
-- 若干 method×model 组合尚未跑满
+- **方法/工程复现完成**：三协议 adapter、12 方法、四维证据、planted-secret、envelope 取证、矩阵与推荐配置
+- **本网关提取受阻**：Claude 签名模型/上下文绑定 + `reasoning_extraction` 分类器；GPT/Gemini 输入签名被网关丢弃
+- **grok**：reasoning 为明文（未加密），不入目标
+- 换不实施缓解的网关即可用同一 harness 重跑矩阵复现论文结果
 
 ---
 
