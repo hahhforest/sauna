@@ -9,6 +9,7 @@ from .provider import (
     GeminiFuzzyExtractionMethod,
     GeminiReconciliationMethod,
     PrefillExtractionMethod,
+    ProviderSingleReplayMethod,
 )
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     "RecoveryMethod",
     "RepeatedInjectionMethod",
     "PrefillExtractionMethod",
+    "ProviderSingleReplayMethod",
     "SingleReplayMethod",
     "TerraFallbackMethod",
     "is_refusal",

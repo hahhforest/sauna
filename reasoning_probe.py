@@ -33,6 +33,7 @@ def method_registry() -> dict[str, object]:
         ClaudeReconciliationMethod,
         GeminiFuzzyExtractionMethod,
         GeminiReconciliationMethod,
+        ProviderSingleReplayMethod,
         ReconciliationMethod,
         RepeatedInjectionMethod,
         SingleReplayMethod,
@@ -45,14 +46,15 @@ def method_registry() -> dict[str, object]:
         "gpt.single_replay": single,
         "gpt.repeated_injection": repeated,
         "gpt.chunk_continuation": ChunkContinuationMethod(),
-        "gpt.single_best_of_3": BestOfNMethod(SingleReplayMethod(), n=3, name="gpt.single_best_of_3"),
-        "gpt.repeated_best_of_3": BestOfNMethod(RepeatedInjectionMethod(), n=3, name="gpt.repeated_best_of_3"),
+        "gpt.single_best_of_n": BestOfNMethod(SingleReplayMethod(), n=50, name="gpt.single_best_of_n"),
+        "gpt.repeated_best_of_n": BestOfNMethod(RepeatedInjectionMethod(), n=50, name="gpt.repeated_best_of_n"),
         "gpt.luna_then_terra": TerraFallbackMethod(
             SingleReplayMethod(), SingleReplayMethod(), fallback_model="gpt-5.6-terra"
         ),
         "gpt.reconcile_with_terra": ReconciliationMethod(
             SingleReplayMethod(), reconciler_model="gpt-5.6-terra"
         ),
+        "claude.single_replay": ProviderSingleReplayMethod(),
         "claude.fuzzy_prefill": ClaudeFuzzyExtractionMethod(),
         "claude.reconciliation": ClaudeReconciliationMethod(),
         "gemini.fuzzy_prefill": GeminiFuzzyExtractionMethod(),
@@ -67,6 +69,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--config", default="", help="配置文件路径，默认 ./config.yaml")
     parser.add_argument("--list-methods", action="store_true", help="列出当前配置可跑的方法后退出")
     parser.add_argument("--family", default="", help="未指定 method 时的家族：gpt|claude|gemini")
+    parser.add_argument("--target", default="", help="目标模型逻辑名；固定 source 并按 targets 段选方法链")
+    parser.add_argument("--secret", default="", help="planted-secret 判别协议的秘密（只进 hidden reasoning）")
     parser.add_argument("--method", default="", help="方法名；缺省按家族默认链解析")
     parser.add_argument("--fallback", default="", help="逗号分隔的备用方法（方法级 fallback）")
     parser.add_argument("--effort", default="")
@@ -142,6 +146,7 @@ def main(argv: list[str] | None = None) -> int:
             app,
             method=args.method or None,
             family=args.family or None,
+            target=args.target or None,
             fallback_methods=fallback,
             effort=args.effort or None,
             max_output_tokens=args.max_output_tokens,
@@ -156,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
             resolved.settings,
             args.prompt,
             method=resolved.method,
+            secret=args.secret or None,
         )
     except ProbeError as exc:
         print(json.dumps({"error": exc.as_dict()}, ensure_ascii=False, indent=2))

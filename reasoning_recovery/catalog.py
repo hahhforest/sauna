@@ -58,6 +58,7 @@ def default_catalog() -> dict[str, MethodSpec]:
         ClaudeReconciliationMethod,
         GeminiFuzzyExtractionMethod,
         GeminiReconciliationMethod,
+        ProviderSingleReplayMethod,
         ReconciliationMethod,
         RepeatedInjectionMethod,
         SingleReplayMethod,
@@ -93,21 +94,27 @@ def default_catalog() -> dict[str, MethodSpec]:
             summary="分块续写",
             build=lambda **_: ChunkContinuationMethod(),
         ),
-        "gpt.single_best_of_3": MethodSpec(
-            name="gpt.single_best_of_3",
+        "gpt.single_best_of_n": MethodSpec(
+            name="gpt.single_best_of_n",
             family="gpt",
             roles=_gpt_base_roles(("luna", "terra")),
             on_unresolved=("gpt.single_replay",),
-            summary="single_replay × 3 选优",
-            build=lambda **_: BestOfNMethod(SingleReplayMethod(), n=3, name="gpt.single_best_of_3"),
+            summary="single_replay × N 采样，按 extraction error 选优",
+            options={"candidate_pool": 50},
+            build=lambda **kw: BestOfNMethod(
+                SingleReplayMethod(), n=int(kw.get("candidate_pool", 50)), name="gpt.single_best_of_n"
+            ),
         ),
-        "gpt.repeated_best_of_3": MethodSpec(
-            name="gpt.repeated_best_of_3",
+        "gpt.repeated_best_of_n": MethodSpec(
+            name="gpt.repeated_best_of_n",
             family="gpt",
             roles=_gpt_base_roles(("luna", "terra")),
             on_unresolved=("gpt.repeated_injection",),
-            summary="repeated_injection × 3 选优",
-            build=lambda **_: BestOfNMethod(RepeatedInjectionMethod(), n=3, name="gpt.repeated_best_of_3"),
+            summary="repeated_injection × N 采样，按 extraction error 选优",
+            options={"candidate_pool": 50},
+            build=lambda **kw: BestOfNMethod(
+                RepeatedInjectionMethod(), n=int(kw.get("candidate_pool", 50)), name="gpt.repeated_best_of_n"
+            ),
         ),
         "gpt.luna_then_terra": MethodSpec(
             name="gpt.luna_then_terra",
@@ -135,7 +142,7 @@ def default_catalog() -> dict[str, MethodSpec]:
                 "decoder": RoleNeed("decoder", prefer=("luna", "terra")),
                 "reconciler": RoleNeed("reconciler", prefer=("terra",)),
             },
-            on_unresolved=("gpt.single_best_of_3", "gpt.single_replay"),
+            on_unresolved=("gpt.single_best_of_n", "gpt.single_replay"),
             summary="多候选 + reconciler 合并",
             build=lambda resolved, **_: ReconciliationMethod(
                 SingleReplayMethod(),
@@ -143,11 +150,22 @@ def default_catalog() -> dict[str, MethodSpec]:
                 name="gpt.reconcile_with_terra",
             ),
         ),
+        "claude.single_replay": MethodSpec(
+            name="claude.single_replay",
+            family="claude",
+            roles={
+                "source": RoleNeed("source", prefer=("opus5", "fable")),
+                "decoder": RoleNeed("decoder", prefer=("haiku",)),
+            },
+            on_unresolved=("claude.fuzzy_prefill",),
+            summary="Claude 无 prefill 同模型 replay（repo 形状）",
+            build=lambda **_: ProviderSingleReplayMethod(),
+        ),
         "claude.fuzzy_prefill": MethodSpec(
             name="claude.fuzzy_prefill",
             family="claude",
             roles={
-                "source": RoleNeed("source", prefer=("opus", "fable", "sonnet")),
+                "source": RoleNeed("source", prefer=("opus5", "fable")),
                 "decoder": RoleNeed("decoder", prefer=("haiku",)),
             },
             on_unresolved=("claude.reconciliation",),
@@ -158,9 +176,9 @@ def default_catalog() -> dict[str, MethodSpec]:
             name="claude.reconciliation",
             family="claude",
             roles={
-                "source": RoleNeed("source", prefer=("opus", "fable", "sonnet")),
+                "source": RoleNeed("source", prefer=("opus5", "fable")),
                 "decoder": RoleNeed("decoder", prefer=("haiku",)),
-                "reconciler": RoleNeed("reconciler", prefer=("opus",)),
+                "reconciler": RoleNeed("reconciler", prefer=("opus5",)),
             },
             on_unresolved=("claude.fuzzy_prefill",),
             summary="Claude 多候选 reconciliation",
@@ -203,13 +221,14 @@ def default_catalog() -> dict[str, MethodSpec]:
 # 各家族默认方法优先级（未指定 --method 时）
 FAMILY_DEFAULT_METHODS: dict[str, tuple[str, ...]] = {
     "gpt": (
+        "gpt.single_best_of_n",
+        "gpt.repeated_best_of_n",
         "gpt.single_replay",
         "gpt.repeated_injection",
         "gpt.chunk_continuation",
-        "gpt.single_best_of_3",
         "gpt.luna_then_terra",
         "gpt.reconcile_with_terra",
     ),
-    "claude": ("claude.fuzzy_prefill", "claude.reconciliation"),
+    "claude": ("claude.single_replay", "claude.fuzzy_prefill", "claude.reconciliation"),
     "gemini": ("gemini.fuzzy_prefill", "gemini.reconciliation"),
 }

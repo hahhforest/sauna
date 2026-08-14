@@ -11,10 +11,11 @@ from .base import RecoveryMethod, is_refusal, strip_transport_wrappers
 
 
 class BestOfNMethod:
-    """同一基础方法跑 N 次，按 marker 命中与长度选最优候选。
+    """同一基础方法跑 N 次，选最优候选。
 
-    原理：单次 transcription 有噪声；独立采样多次后，优先选命中 marker、
-    token 数接近 source reasoning tokens 的候选。
+    原理：单次 transcription 有噪声；独立采样多次后按论文 C.2 排序：
+    planted-secret 命中 > extraction error（|1 - extracted/billed|，越小越好）
+    > marker 命中 > 绝对长度。
     """
 
     def __init__(self, base: RecoveryMethod, n: int = 3, name: str | None = None) -> None:
@@ -245,14 +246,15 @@ def _usable(text: str) -> bool:
     return bool(text.strip()) and not is_refusal(text)
 
 
-def _candidate_score(text: str, context: MethodContext) -> tuple[int, int, int]:
-    """best-of-N 排序键：marker 命中 > 长度接近 source tokens > 绝对长度。"""
+def _candidate_score(text: str, context: MethodContext) -> tuple[int, float, int, int]:
+    """best-of-N 排序键（论文 C.2 优先序）。"""
     if not _usable(text):
-        return (0, 0, 0)
-    marker_hit = int(context.harvest.marker in text)
+        return (0, 0.0, 0, 0)
+    secret_hit = int(bool(context.harvest.secret) and context.harvest.secret in text)
+    marker_hit = int(bool(context.harvest.marker) and context.harvest.marker in text)
     target = context.harvest.source_reasoning_tokens or 0
-    length_score = -abs(len(text.split()) - target) if target else len(text)
-    return (marker_hit, length_score, len(text))
+    error = abs(len(text.split()) - target) / target if target else 0.0
+    return (secret_hit, -error, marker_hit, len(text))
 
 
 def _reconciliation_score(text: str, context: MethodContext) -> tuple[float, int]:
