@@ -6,6 +6,7 @@
 #   2. 方法自己声明依赖哪些角色（source / decoder / reconciler…）。
 #   3. 某角色在 prefer 链上找不到已配置模型 → 明确报错，再走方法级 fallback。
 #   4. 没配 gpt 家族 → 不能跑 gpt.*；没配 claude → 不能跑 claude.*。
+#   5. targets 段按目标模型定制方法链与 decoder（矩阵实验生成推荐值）。
 #
 # config.yaml 已 gitignore。环境变量可覆盖 upstream：
 #   UPSTREAM_BASE_URL / UPSTREAM_API_KEY / SAUNA_CONFIG
@@ -36,15 +37,15 @@ runtime:
 # id  = 上游真实 model id
 # family = gpt | claude | gemini（决定能跑哪一类方法）
 # roles  = 该模型能承担的角色：source | decoder | reconciler
+#          （网关若强制 signature 与请求模型一致，source 兼任 decoder 即同模型自解码）
 # protocol / headers / model_config 可按模型覆盖
 models:
-  # —— GPT 家族示例（按需取消注释并改成你的真实 id）——
+  # —— GPT 家族 ——
   sol:
     family: gpt
     id: gpt-5.6-sol
     protocol: responses
     roles: [source]
-    # effort: high
 
   luna:
     family: gpt
@@ -59,24 +60,38 @@ models:
     roles: [decoder, reconciler]
 
   # —— Claude 家族 ——
-  # opus:
-  #   family: claude
-  #   id: claude-opus-4-8
-  #   protocol: anthropic_messages
-  #   roles: [source, reconciler]
-  #   headers:
-  #     anthropic-version: "2023-06-01"
-  #   model_config:
-  #     prefill_tag: "<thinking-copy>"
-  #     thinking: {type: adaptive, display: omitted}
-  #
-  # haiku:
-  #   family: claude
-  #   id: claude-haiku-4-5
-  #   protocol: anthropic_messages
-  #   roles: [decoder]
+  # fable 支持 assistant prefill；opus-5 经网关不支持 prefill → 用 single_replay
+  fable:
+    family: claude
+    id: claude-fable-5
+    protocol: anthropic_messages
+    roles: [source, decoder, reconciler]
+    headers:
+      anthropic-version: "2023-06-01"
+    model_config:
+      prefill_tag: "<thinking-copy>"
+      thinking: {type: adaptive, display: omitted}
 
-  # —— Gemini 家族 ——
+  opus5:
+    family: claude
+    id: claude-opus-5
+    protocol: anthropic_messages
+    roles: [source, decoder, reconciler]
+    headers:
+      anthropic-version: "2023-06-01"
+    model_config:
+      prefill_tag: "<thinking-copy>"
+      thinking: {type: adaptive, display: omitted}
+
+  haiku:
+    family: claude
+    id: claude-haiku-4-5
+    protocol: anthropic_messages
+    roles: [decoder]
+    headers:
+      anthropic-version: "2023-06-01"
+
+  # —— Gemini 家族（按需取消注释）——
   # gemini_pro:
   #   family: gemini
   #   id: gemini-3.1-pro-preview
@@ -99,22 +114,35 @@ protocols:
   responses: {}
   chat_completions: {}
   anthropic_messages:
-    # auth: x-api-key
     headers:
-      # anthropic-version: "2023-06-01"
+      anthropic-version: "2023-06-01"
   gemini: {}
 
+# ---------- 按目标模型的方法链与 decoder 偏好 ----------
+# targets.<逻辑名>.methods = 未显式给 --method 时的有序方法链
+# targets.<逻辑名>.decoder = 该目标下的 decoder prefer 链
+# 推荐值由矩阵实验生成：scripts/run_provider_matrix.py 输出
+# runs/targets.recommended.yaml，可按实验结论直接并入本段。
+targets:
+  sol:
+    decoder: [luna, terra]
+    methods:
+      - gpt.single_best_of_n
+      - gpt.repeated_best_of_n
+      - gpt.single_replay
+      - gpt.chunk_continuation
+      - gpt.reconcile_with_terra
+  fable:
+    decoder: [fable]
+    methods: [claude.fuzzy_prefill, claude.single_replay, claude.reconciliation]
+  opus5:
+    decoder: [opus5]
+    methods: [claude.single_replay, claude.reconciliation]
+
 # ---------- 方法链（可选覆盖）----------
-# 内置默认见代码 METHOD_CATALOG；这里可改 prefer / fallback
+# 内置默认见 catalog.py；这里可改 prefer / fallback
 # methods:
 #   gpt.single_replay:
 #     prefer:
 #       source: [sol]
 #       decoder: [luna, terra]   # luna 没有则用 terra
-#   gpt.luna_then_terra:
-#     prefer:
-#       source: [sol]
-#       decoder: [luna]         # 主 decoder 必须 luna
-#       fallback_decoder: [terra]
-#     # 整方法解析失败时，改试这些方法
-#     on_unresolved: [gpt.single_replay, gpt.repeated_injection]

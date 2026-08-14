@@ -69,6 +69,9 @@ class AppConfig:
     protocols: dict[str, Any] = field(default_factory=dict)
     models: dict[str, ModelEntry] = field(default_factory=dict)
     method_overrides: dict[str, Any] = field(default_factory=dict)
+    # 按目标模型（逻辑名）定制：方法链 + decoder 偏好。
+    # 由矩阵实验生成推荐默认，用户可改。
+    targets: dict[str, dict[str, Any]] = field(default_factory=dict)
     path: Path | None = None
 
     def families(self) -> set[str]:
@@ -133,6 +136,12 @@ def load_app_config(path: str | Path | None = None, *, require: bool = False) ->
     runtime = dict(raw.get("runtime") or raw.get("defaults") or {})
 
     models = _parse_models(raw.get("models") or {})
+    targets_raw = raw.get("targets") or {}
+    targets = (
+        {str(k): v for k, v in targets_raw.items() if isinstance(v, dict)}
+        if isinstance(targets_raw, dict)
+        else {}
+    )
     app = AppConfig(
         upstream=UpstreamConfig(
             base_url=base_url.rstrip("/"),
@@ -146,6 +155,7 @@ def load_app_config(path: str | Path | None = None, *, require: bool = False) ->
         protocols=dict(raw.get("protocols") or {}),
         models=models,
         method_overrides=dict(raw.get("methods") or {}),
+        targets=targets,
         path=config_path,
     )
     if require:
@@ -171,6 +181,8 @@ def resolve_method_run(
     method: str | None = None,
     *,
     family: str | None = None,
+    target: str | None = None,
+    decoder: str | None = None,
     fallback_methods: tuple[str, ...] | list[str] = (),
     effort: str | None = None,
     max_output_tokens: int | None = None,
@@ -181,11 +193,17 @@ def resolve_method_run(
     selection_count: int | None = None,
     catalog: dict[str, MethodSpec] | None = None,
 ) -> ResolvedMethodRun:
-    """按方法依赖解析模型角色，失败则沿 fallback / on_unresolved 链继续。"""
+    """按方法依赖解析模型角色，失败则沿 fallback / on_unresolved 链继续。
+
+    Args:
+        target: 目标模型逻辑名。给定后 source 角色固定为该模型，
+            未显式给 method 时优先使用 targets.<name>.methods 方法链。
+        decoder: 显式覆盖 decoder 逻辑名（矩阵实验用）。
+    """
     cat = catalog or default_catalog()
     log: list[str] = []
 
-    chain = _build_method_chain(app, method, family, fallback_methods, cat, log)
+    chain = _build_method_chain(app, method, family, fallback_methods, cat, log, target)
     errors: list[dict[str, Any]] = []
 
     for name in chain:
@@ -207,7 +225,7 @@ def resolve_method_run(
             continue
 
         try:
-            role_names, role_ids, role_entries = _resolve_roles(app, spec, log)
+            role_names, role_ids, role_entries = _resolve_roles(app, spec, log, target, decoder)
         except ProbeError as exc:
             log.append(f"{name}: unresolved — {exc.message}")
             errors.append({"method": name, "code": exc.code, "details": exc.details})
@@ -238,8 +256,16 @@ def resolve_method_run(
             resolution_log=tuple(log + [f"{name}: ok source={role_names['source']} decoder={role_names['decoder']}"]),
         )
         options = {
-            "candidate_pool": candidate_pool if candidate_pool is not None else 3,
-            "selection_count": selection_count if selection_count is not None else 3,
+            "candidate_pool": (
+                candidate_pool
+                if candidate_pool is not None
+                else int(spec.options.get("candidate_pool", 3))
+            ),
+            "selection_count": (
+                selection_count
+                if selection_count is not None
+                else int(spec.options.get("selection_count", 3))
+            ),
         }
         if spec.build is None:
             raise ProbeError("METHOD_NO_BUILDER", f"方法无 builder: {name}")
@@ -337,28 +363,40 @@ def _build_method_chain(
     fallback_methods: tuple[str, ...] | list[str],
     catalog: dict[str, MethodSpec],
     log: list[str],
+    target: str | None = None,
 ) -> list[str]:
-    """构造待尝试的方法有序列表。"""
+    """构造待尝试的方法有序列表。
+
+    优先级：显式 method > targets.<target>.methods > 家族默认链。
+    """
     chain: list[str] = []
     if method:
         chain.append(method)
     else:
-        fam = (family or _as_str(app.runtime.get("default_family")) or "").lower()
-        if not fam:
-            # 有哪个家族就用哪个
-            configured = app.families()
-            for candidate in ("gpt", "claude", "gemini"):
-                if candidate in configured:
-                    fam = candidate
-                    break
-        if not fam:
-            raise ProbeError(
-                "FAMILY_NOT_CONFIGURED",
-                "未配置任何模型家族。请在 config.yaml 的 models 下添加至少一条模型。",
-            )
-        defaults = FAMILY_DEFAULT_METHODS.get(fam, ())
-        chain.extend(defaults)
-        log.append(f"default family={fam} methods={list(defaults)}")
+        target_block = app.targets.get(target) if target else None
+        target_methods = (
+            [str(m) for m in target_block["methods"]] if target_block and target_block.get("methods") else []
+        )
+        if target_methods:
+            chain.extend(target_methods)
+            log.append(f"target={target} methods={target_methods}")
+        else:
+            fam = (family or _as_str(app.runtime.get("default_family")) or "").lower()
+            if not fam:
+                # 有哪个家族就用哪个
+                configured = app.families()
+                for candidate in ("gpt", "claude", "gemini"):
+                    if candidate in configured:
+                        fam = candidate
+                        break
+            if not fam:
+                raise ProbeError(
+                    "FAMILY_NOT_CONFIGURED",
+                    "未配置任何模型家族。请在 config.yaml 的 models 下添加至少一条模型。",
+                )
+            defaults = FAMILY_DEFAULT_METHODS.get(fam, ())
+            chain.extend(defaults)
+            log.append(f"default family={fam} methods={list(defaults)}")
     for item in fallback_methods:
         if item and item not in chain:
             chain.append(item)
@@ -370,14 +408,32 @@ def _resolve_roles(
     app: AppConfig,
     spec: MethodSpec,
     log: list[str],
+    target: str | None = None,
+    decoder: str | None = None,
 ) -> tuple[dict[str, str], dict[str, str], dict[str, ModelEntry]]:
-    """为方法解析全部必需角色。"""
-    roles_spec = _apply_method_overrides(app, spec)
+    """为方法解析全部必需角色。target/decoder 给定则对应角色固定。"""
+    roles_spec = _apply_method_overrides(app, spec, target)
     names: dict[str, str] = {}
     ids: dict[str, str] = {}
     entries: dict[str, ModelEntry] = {}
     for role_name, need in roles_spec.items():
-        entry = _pick_model(app, spec.family, need, log, role_name)
+        entry: ModelEntry | None = None
+        if target and role_name == "source":
+            entry = app.models.get(target)
+            if entry is not None and (
+                entry.family != spec.family or need.capability not in entry.roles
+            ):
+                entry = None
+            log.append(f"  {role_name}: pinned target {target}")
+        elif decoder and role_name == "decoder":
+            entry = app.models.get(decoder)
+            if entry is not None and (
+                entry.family != spec.family or need.capability not in entry.roles
+            ):
+                entry = None
+            log.append(f"  {role_name}: pinned decoder {decoder}")
+        else:
+            entry = _pick_model(app, spec.family, need, log, role_name)
         if entry is None:
             if need.required:
                 raise ProbeError(
@@ -408,8 +464,10 @@ def _resolve_roles(
     return names, ids, entries
 
 
-def _apply_method_overrides(app: AppConfig, spec: MethodSpec) -> dict[str, RoleNeed]:
-    """合并 config.methods.<name>.prefer 覆盖。"""
+def _apply_method_overrides(
+    app: AppConfig, spec: MethodSpec, target: str | None = None
+) -> dict[str, RoleNeed]:
+    """合并 config.methods.<name>.prefer 与 targets.<target>.decoder 覆盖。"""
     override = app.method_overrides.get(spec.name) or {}
     prefer_map = override.get("prefer") or {}
     roles = dict(spec.roles)
@@ -423,6 +481,17 @@ def _apply_method_overrides(app: AppConfig, spec: MethodSpec) -> dict[str, RoleN
                 prefer_t = tuple(str(x) for x in prefer_list)
             old = roles[role_name]
             roles[role_name] = RoleNeed(old.capability, prefer=prefer_t, required=old.required)
+    # targets.<name>.decoder：该目标模型下的 decoder 偏好链（矩阵实验推荐值）
+    if target and "decoder" in roles:
+        target_block = app.targets.get(target) or {}
+        decoder_prefer = target_block.get("decoder")
+        if isinstance(decoder_prefer, str):
+            decoder_prefer = [decoder_prefer]
+        if isinstance(decoder_prefer, (list, tuple)) and decoder_prefer:
+            old = roles["decoder"]
+            roles["decoder"] = RoleNeed(
+                old.capability, prefer=tuple(str(x) for x in decoder_prefer), required=old.required
+            )
     return roles
 
 
