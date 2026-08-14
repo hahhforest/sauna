@@ -61,6 +61,7 @@ def _harvest_record(
     marker: str,
     payload: dict[str, Any],
     visible: str,
+    secret: str | None = None,
     extra_signature_fields: tuple[str, ...] = (),
 ) -> HarvestRecord:
     """从 provider 响应构造 HarvestRecord；无 envelope 则抛错。"""
@@ -77,6 +78,7 @@ def _harvest_record(
         user_prompt=user_prompt,
         source_prompt=make_source_prompt(user_prompt),
         marker=marker,
+        secret=secret,
         visible_answer=visible,
         envelope=envelopes[0],
         source_payload=payload,
@@ -97,7 +99,9 @@ class AnthropicMessagesAdapter:
         """对外暴露的可见文本解析。"""
         return _anthropic_visible_text(payload)
 
-    def harvest(self, settings: Settings, user_prompt: str, marker: str) -> HarvestRecord:
+    def harvest(
+        self, settings: Settings, user_prompt: str, marker: str, secret: str | None = None
+    ) -> HarvestRecord:
         """采集 Claude source 的 thinking signature。"""
         thinking = settings.model_config.get(
             "thinking", {"type": "adaptive", "display": "omitted"}
@@ -105,7 +109,7 @@ class AnthropicMessagesAdapter:
         body = {
             "model": settings.source_model,
             "max_tokens": settings.max_output_tokens,
-            "system": make_source_instructions(marker),
+            "system": make_source_instructions(marker, secret),
             "thinking": dict(thinking) if isinstance(thinking, dict) else thinking,
             "messages": [{"role": "user", "content": make_source_prompt(user_prompt)}],
         }
@@ -115,16 +119,21 @@ class AnthropicMessagesAdapter:
             protocol=self.name,
             user_prompt=user_prompt,
             marker=marker,
+            secret=secret,
             payload=payload,
             visible=_anthropic_visible_text(payload),
             extra_signature_fields=tuple(settings.model_config.get("signature_fields", ())),
         )
 
     def replay(self, context: MethodContext, items: list[dict[str, Any]]) -> dict[str, Any]:
-        """Claude messages replay。"""
+        """Claude messages replay。
+
+        论文 C.1：fuzzy 解码在 temperature 1 下采样。
+        """
         body = {
             "model": context.decoder_model,
             "max_tokens": context.max_output_tokens,
+            "temperature": context.temperature,
             "messages": items,
         }
         return self.client.post("messages", body, context.timeout)
@@ -238,10 +247,12 @@ class GeminiGenerateContentAdapter:
             level = "high"
         return {str(options.get("thinking_level_field", "thinkingLevel")): level}
 
-    def harvest(self, settings: Settings, user_prompt: str, marker: str) -> HarvestRecord:
+    def harvest(
+        self, settings: Settings, user_prompt: str, marker: str, secret: str | None = None
+    ) -> HarvestRecord:
         """采集 Gemini source 的 thought signature。"""
         body = {
-            "systemInstruction": {"parts": [{"text": make_source_instructions(marker)}]},
+            "systemInstruction": {"parts": [{"text": make_source_instructions(marker, secret)}]},
             "contents": [{"role": "user", "parts": [{"text": make_source_prompt(user_prompt)}]}],
             "generationConfig": {
                 "maxOutputTokens": settings.max_output_tokens,
@@ -256,6 +267,7 @@ class GeminiGenerateContentAdapter:
             protocol=self.name,
             user_prompt=user_prompt,
             marker=marker,
+            secret=secret,
             payload=payload,
             visible=_gemini_visible_text(payload),
             extra_signature_fields=tuple(settings.model_config.get("signature_fields", ())),
@@ -267,6 +279,7 @@ class GeminiGenerateContentAdapter:
             "contents": items,
             "generationConfig": {
                 "maxOutputTokens": context.max_output_tokens,
+                "temperature": context.temperature,
                 "thinkingConfig": self._thinking_config(context.effort, context.model_config),
             },
         }
@@ -275,7 +288,7 @@ class GeminiGenerateContentAdapter:
         )
 
     def _thought_part(self, context: MethodContext, text: str) -> dict[str, Any]:
-        """构造带 signature 的 model part。"""
+        """构造带 signature 的 model part（形状与 source 响应 part 一致）。"""
         envelope = context.harvest.envelope
         return {"text": text, envelope.field: envelope.value}
 

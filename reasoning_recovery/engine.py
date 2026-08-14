@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from typing import Any, Callable
 
 from .errors import ProbeError
+from .methods.base import is_refusal
 from .models import (
     AttemptRecord,
     DimensionResult,
@@ -49,14 +50,18 @@ class RecoveryEngine:
         baseline_text: str | None = None,
         semantic_verifier: Callable[[str, Any], bool] | None = None,
         elicitation: str | None = None,
+        secret: str | None = None,
     ) -> RecoveryResult:
         """执行一次完整恢复。
 
         先 harvest source envelope，再按 method + fallback 顺序尝试。
         返回完整恢复正文，不做脱敏截断。
+
+        Args:
+            secret: planted-secret 判别协议的秘密（只进 source hidden reasoning）。
         """
         marker = new_marker()
-        harvest = self.adapter.harvest(settings, user_prompt, marker)
+        harvest = self.adapter.harvest(settings, user_prompt, marker, secret)
         names = [method] if method else []
         names.extend(fallback)
         if not names:
@@ -104,10 +109,16 @@ class RecoveryEngine:
                 semantic_verifier=semantic_verifier,
             )
             replay, provenance, coverage, fidelity = dimensions
+            if is_refusal(result.text):
+                status = "refused"
+            elif _acceptable(provenance, fidelity, result.text):
+                status = "success"
+            else:
+                status = "low_confidence"
             attempts.append(
                 AttemptRecord(
                     name,
-                    "success" if _acceptable(provenance, fidelity, result.text) else "low_confidence",
+                    status,
                     metadata={
                         "replay": replay.status,
                         "provenance": provenance.status,
@@ -148,22 +159,59 @@ class RecoveryEngine:
 
 
 def _acceptable(provenance: DimensionResult, fidelity: DimensionResult, text: str) -> bool:
-    """判断当前结果是否足够好以停止 fallback。"""
-    return bool(text) and provenance.status in {"supported", "not_evaluated"} and fidelity.status != "fail"
+    """判断当前结果是否足够好以停止 fallback。
+
+    拒答不算可用结果：不得阻断后续 fallback 链。
+    """
+    return (
+        bool(text)
+        and not is_refusal(text)
+        and provenance.status in {"supported", "not_evaluated"}
+        and fidelity.status != "fail"
+    )
+
+
+def _raw_signals(raw_outputs: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
+    """从 decoder 原始响应提取 stop/拒绝信号（完整正文不落在此处）。"""
+    signals: list[dict[str, Any]] = []
+    for payload in raw_outputs:
+        signal: dict[str, Any] = {}
+        if isinstance(payload, dict):
+            if payload.get("stop_reason") is not None:
+                signal["stop_reason"] = payload["stop_reason"]
+            if isinstance(payload.get("stop_details"), dict):
+                signal["stop_details"] = payload["stop_details"]
+            output = payload.get("output")
+            if isinstance(output, list) and output:
+                last = output[-1]
+                if isinstance(last, dict) and last.get("status") is not None:
+                    signal["last_item_status"] = last["status"]
+            candidates = payload.get("candidates")
+            if isinstance(candidates, list) and candidates:
+                first = candidates[0]
+                if isinstance(first, dict) and first.get("finishReason") is not None:
+                    signal["finish_reason"] = first["finishReason"]
+        if signal:
+            signals.append(signal)
+    return signals
 
 
 def _source_metadata(harvest: Any) -> dict[str, Any]:
     """从 harvest 提取研究用 source 侧字段（含可见答案与 marker）。"""
+    from .envelope_inspect import inspect_envelope
+
     return {
         "source_model": harvest.source_model,
         "protocol": harvest.protocol,
         "user_prompt": harvest.user_prompt,
         "source_prompt": harvest.source_prompt,
         "marker": harvest.marker,
+        "secret": harvest.secret,
         "visible_answer": harvest.visible_answer,
         "envelope_field": harvest.envelope.field,
         "envelope_path": harvest.envelope.path,
         "envelope_value": harvest.envelope.value,
+        "envelope_meta": inspect_envelope(harvest.envelope.value),
         "source_reasoning_tokens": harvest.source_reasoning_tokens,
         "visible_answer_length": len(harvest.visible_answer),
     }
@@ -181,6 +229,7 @@ def _result(
     """组装最终 RecoveryResult。"""
     replay, provenance, coverage, fidelity = dimensions
     metadata: dict[str, Any] = {"method_metadata": result.metadata}
+    metadata["raw_signals"] = _raw_signals(result.raw_outputs)
     if harvest is not None:
         metadata["source"] = _source_metadata(harvest)
     if terminal_error:

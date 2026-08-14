@@ -38,22 +38,28 @@ def validate_provenance(
     baseline_text: str | None = None,
     provenance_safe: bool = True,
 ) -> DimensionResult:
-    """用 marker 判断恢复文本是否来自 source hidden reasoning。
+    """用 marker / planted secret 判断恢复文本是否来自 source hidden reasoning。
 
-    marker 只应出现在 source instruction；若命中 decoder 输出且不命中 baseline，
-    则 provenance=supported。reconciliation 等方法会把候选写进 prompt，
-    此时 provenance_safe=False → invalidated。
+    marker 与 secret 只出现在 source instruction，绝不进入 replay 的明文上下文；
+    命中 decoder 输出即为 source-only 证据。reconciliation 等方法会把候选写进
+    prompt，此时 provenance_safe=False → invalidated。
     """
     marker_hit = bool(harvest.marker) and harvest.marker in recovered_text
+    secret_hit = bool(harvest.secret) and harvest.secret in recovered_text
     baseline_hit = None if baseline_text is None else harvest.marker in baseline_text
     evidence = {
         "marker": harvest.marker,
         "marker_hit": marker_hit,
+        "secret": harvest.secret,
+        "secret_hit": secret_hit,
         "baseline_marker_hit": baseline_hit,
         "provenance_safe": provenance_safe,
     }
     if not provenance_safe:
         return DimensionResult("invalidated", evidence)
+    if secret_hit:
+        # planted secret 逐字符命中 = 真解封的最强证据
+        return DimensionResult("supported", evidence)
     if marker_hit and baseline_hit is False:
         return DimensionResult("supported", evidence)
     if marker_hit:
@@ -69,13 +75,18 @@ def validate_coverage(
     *,
     token_counter: TokenCounter = whitespace_token_count,
 ) -> DimensionResult:
-    """估计恢复覆盖率 = recovered_tokens / source_reasoning_tokens。"""
+    """估计恢复覆盖率 = recovered_tokens / source_reasoning_tokens。
+
+    论文 C.2 的 extraction error 同源指标：billing token 数视为精确。
+    同时落字符数，避免 CJK 等空白分词偏差误导 ratio。
+    """
     source_tokens = harvest.source_reasoning_tokens
     recovered_tokens = token_counter(recovered_text)
     evidence = {
         "source_tokens": source_tokens,
         "recovered_tokens": recovered_tokens,
         "recovered_text_length": len(recovered_text),
+        "recovered_chars": len(recovered_text),
     }
     if not source_tokens:
         return DimensionResult("unknown", evidence)
